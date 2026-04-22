@@ -38,7 +38,7 @@ class STTEngine:
             self.model = WhisperModel(self.model_size, device=self.device, compute_type=self.compute_type)
             print("Model loaded successfully.")
 
-    def transcribe(self, audio_path, language=None, initial_prompt=None):
+    def transcribe(self, audio_path, language=None, initial_prompt=None, word_timestamps=False):
         self.load_model()
         
         # segments is an iterable
@@ -47,7 +47,8 @@ class STTEngine:
             beam_size=5, 
             language=language, 
             initial_prompt=initial_prompt,
-            condition_on_previous_text=True
+            condition_on_previous_text=True,
+            word_timestamps=word_timestamps
         )
         
         print(f"Detected language '{info.language}' with probability {info.language_probability:.2f}")
@@ -64,10 +65,20 @@ class STTEngine:
             task = progress.add_task("Transcribing...", total=None) # Total duration unknown initially
             
             for segment in segments:
+                words = []
+                if word_timestamps and segment.words:
+                    for word in segment.words:
+                        words.append({
+                            "start": word.start,
+                            "end": word.end,
+                            "text": word.word.strip()
+                        })
+                
                 results.append({
                     "start": segment.start,
                     "end": segment.end,
-                    "text": segment.text.strip()
+                    "text": segment.text.strip(),
+                    "words": words if word_timestamps else None
                 })
                 # Update progress (optional, since segments is a generator, total is hard to guess)
                 progress.update(task, advance=1, description=f"Transcribed: {segment.text[:30]}...")

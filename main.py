@@ -1,13 +1,15 @@
-import argparse
 import os
-import sys
+import time
+import argparse
 from rich.console import Console
 from rich.panel import Panel
 from stt_engine import STTEngine
 from audio_utils import record_audio, check_file_exists
 from gdrive_utils import download_from_gdrive, is_gdrive_url
 from output_utils import export_all, get_downloads_path
-import time
+from diarizer import NeMoDiarizer, align_words_with_speakers
+from summarizer import LMStudioSummarizer
+
 
 console = Console()
 
@@ -23,6 +25,9 @@ def main():
     trans_parser.add_argument("--model", default="large-v3-turbo", help="Whisper model size (base, small, medium, large-v3-turbo)")
     trans_parser.add_argument("--lang", default=None, help="Language code (e.g., 'ko', 'en')")
     trans_parser.add_argument("--prompt", default=None, help="Initial prompt to provide context for the transcription")
+    trans_parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization")
+    trans_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
+    trans_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
 
     # Record command
     record_parser = subparsers.add_parser("record", help="Record from microphone and transcribe")
@@ -37,6 +42,9 @@ def main():
     gdrive_parser.add_argument("--model", default="large-v3-turbo", help="Whisper model size")
     gdrive_parser.add_argument("--lang", default="ko", help="Forced language (default: ko)")
     gdrive_parser.add_argument("--prompt", default=None, help="Initial prompt for context")
+    gdrive_parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization")
+    gdrive_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
+    gdrive_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
 
     # Batch command
     batch_parser = subparsers.add_parser("batch", help="Process multiple links/files from a text file")
@@ -53,19 +61,39 @@ def main():
     def get_engine(model_size):
         return STTEngine(model_size=model_size, device=args.device, compute_type=args.compute_type)
 
+    def process_advanced_features(audio_path, results):
+        diarized_results = None
+        summary_text = None
+        
+        if getattr(args, 'diarize', False) or getattr(args, 'summary', False):
+            diarizer = NeMoDiarizer()
+            speaker_segments = diarizer.run_diarization(audio_path)
+            diarized_results = align_words_with_speakers(results, speaker_segments)
+            
+            if getattr(args, 'summary', False):
+                summarizer = LMStudioSummarizer()
+                summary_text = summarizer.summarize_timeline(diarized_results)
+                
+        return diarized_results, summary_text
+
+
+
     if args.command == "transcribe":
         if not check_file_exists(args.file):
             console.print(f"[red]Error: File '{args.file}' not found.[/red]")
             return
 
         engine = get_engine(args.model)
-        results, info = engine.transcribe(args.file, language=args.lang, initial_prompt=args.prompt)
+        word_ts = getattr(args, 'diarize', False) or getattr(args, 'summary', False)
+        results, info = engine.transcribe(args.file, language=args.lang, initial_prompt=args.prompt, word_timestamps=word_ts)
+        
+        diarized_results, summary_text = process_advanced_features(args.file, results)
         
         base_name = os.path.splitext(args.file)[0]
-        export_all(results, base_name)
+        export_all(results, base_name, diarized_results, summary_text)
         
         console.print(f"\n[bold green]Transcription complete![/bold green]")
-        console.print(f"Results saved to: {base_name}.txt, .srt, .json")
+        console.print(f"Results saved to: {base_name}.txt, .srt, .json, and more if requested.")
         
         # Show a preview
         preview = " ".join([s["text"] for s in results[:3]])
@@ -97,15 +125,18 @@ def main():
         
         if audio_path:
             engine = get_engine(args.model)
-            results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt)
+            word_ts = getattr(args, 'diarize', False) or getattr(args, 'summary', False)
+            results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt, word_timestamps=word_ts)
+            
+            diarized_results, summary_text = process_advanced_features(audio_path, results)
             
             # Result filename based on input
             file_name = f"GDrive_STT_{int(time.time())}"
             out_base = os.path.join(get_downloads_path(), file_name)
-            export_all(results, out_base)
+            export_all(results, out_base, diarized_results, summary_text)
             
             console.print(f"\n[bold green]Transcription complete![/bold green]")
-            console.print(f"Results saved to: [cyan]{out_base}.txt, .srt, .json[/cyan]")
+            console.print(f"Results saved to: [cyan]{out_base}[/cyan] (Formats: txt, srt, json, etc)")
 
     elif args.command == "batch":
         if not check_file_exists(args.input_file):

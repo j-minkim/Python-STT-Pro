@@ -46,7 +46,15 @@ Then run:
 ./run.sh batch list.txt --prompt "중고등 입시 컨설팅"
 ```
 
-### 3. GPU Acceleration (Windows/Linux with NVIDIA GPU)
+### 3. AI Meeting Assistant: Diarization & Summarization
+Who spoke when? And what was the meeting about? This tool can automatically detect speakers and summarize the context using **LMStudio**.
+*Note: Make sure LMStudio is open and the 'Local Server' is started on port 1234 before using `--summary`.*
+```bash
+./run.sh transcribe audio.mp3 --diarize --summary
+```
+This generates `..._diarized.txt`, `_diarized.json`, and an `..._summary.md` report!
+
+### 4. GPU Acceleration (Windows/Linux with NVIDIA GPU)
 If you have a 24GB RAM machine with an NVIDIA GPU, add `--device cuda`:
 ```cmd
 run.bat batch list.txt --device cuda --compute_type float16

@@ -4,3 +4,6 @@ sounddevice
 soundfile
 numpy
 python-dotenv
+gdown
+openai
+nemo_toolkit[asr]
