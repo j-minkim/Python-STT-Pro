@@ -1,0 +1,30 @@
+# Python environments
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac OS
+.DS_Store
+
+# User data & output files
+data/
+*.mp3
+*.wav
+*.json
+*.srt
+*.txt
+!requirements.txt
+!batch_links.txt
+
+# Whisper models (just in case they are downloaded locally)
+models/
+*.bin
+*.pt
