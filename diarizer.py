@@ -2,11 +2,23 @@ import os
 import json
 import uuid
 import collections
-from nemo.collections.asr.models import ClusteringDiarizer
-from omegaconf import OmegaConf
+
+try:
+    from nemo.collections.asr.models import ClusteringDiarizer
+    from omegaconf import OmegaConf
+    NEMO_AVAILABLE = True
+except ImportError:
+    NEMO_AVAILABLE = False
+    ClusteringDiarizer = None
+    OmegaConf = None
 
 class NeMoDiarizer:
     def __init__(self, out_dir="data/diarization_output"):
+        if not NEMO_AVAILABLE:
+            raise ImportError(
+                "nemo_toolkit is not installed. Speaker diarization is not available on Windows.\n"
+                "To use diarization, please run on Linux/Mac or install nemo_toolkit manually."
+            )
         self.out_dir = out_dir
         os.makedirs(self.out_dir, exist_ok=True)
 

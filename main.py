@@ -27,7 +27,6 @@ def main():
     trans_parser.add_argument("--prompt", default=None, help="Initial prompt to provide context for the transcription")
     trans_parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization")
     trans_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
-    trans_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
 
     # Record command
     record_parser = subparsers.add_parser("record", help="Record from microphone and transcribe")
@@ -43,7 +42,6 @@ def main():
     gdrive_parser.add_argument("--lang", default="ko", help="Forced language (default: ko)")
     gdrive_parser.add_argument("--prompt", default=None, help="Initial prompt for context")
     gdrive_parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization")
-    gdrive_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
     gdrive_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
 
     # Batch command
@@ -66,13 +64,17 @@ def main():
         summary_text = None
         
         if getattr(args, 'diarize', False) or getattr(args, 'summary', False):
-            diarizer = NeMoDiarizer()
-            speaker_segments = diarizer.run_diarization(audio_path)
-            diarized_results = align_words_with_speakers(results, speaker_segments)
-            
-            if getattr(args, 'summary', False):
-                summarizer = LMStudioSummarizer()
-                summary_text = summarizer.summarize_timeline(diarized_results)
+            try:
+                diarizer = NeMoDiarizer()
+                speaker_segments = diarizer.run_diarization(audio_path)
+                diarized_results = align_words_with_speakers(results, speaker_segments)
+                
+                if getattr(args, 'summary', False):
+                    summarizer = LMStudioSummarizer()
+                    summary_text = summarizer.summarize_timeline(diarized_results)
+            except ImportError as e:
+                console.print(f"[yellow]Warning: {e}[/yellow]")
+                console.print("[yellow]Skipping diarization and summary. Continuing with transcription only.[/yellow]")
                 
         return diarized_results, summary_text
 

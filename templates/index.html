@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Python STT Pro | High-Performance AI Transcription</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        :root {
+            --primary: #00F2FE;
+            --secondary: #4FACFE;
+            --bg: #0F172A;
+            --surface: rgba(30, 41, 59, 0.7);
+            --text: #F8FAFC;
+            --text-muted: #94A3B8;
+            --accent: #F472B6;
+            --success: #10B981;
+            --warning: #F59E0B;
+            --error: #EF4444;
+            --radius: 16px;
+            --glass: backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg);
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(79, 172, 254, 0.1) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(244, 114, 182, 0.1) 0%, transparent 40%);
+            color: var(--text);
+            line-height: 1.6;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 60px;
+            animation: fadeInDown 0.8s ease-out;
+        }
+
+        h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            letter-spacing: -0.05em;
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 1.2rem;
+            font-weight: 300;
+        }
+
+        .glass-card {
+            background: var(--surface);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: var(--radius);
+            padding: 32px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            margin-bottom: 30px;
+            transition: transform 0.3s ease;
+        }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 30px;
+        }
+
+        @media (max-width: 850px) {
+            .main-grid { grid-template-columns: 1fr; }
+        }
+
+        /* Forms */
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--text);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        select, input[type="text"] {
+            width: 100%;
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 12px 16px;
+            color: white;
+            font-family: inherit;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+
+        select:focus, input[type="text"]:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.2);
+        }
+
+        /* Dropzone */
+        .dropzone {
+            border: 2px dashed rgba(255, 255, 255, 0.2);
+            border-radius: var(--radius);
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: rgba(255, 255, 255, 0.02);
+            margin-bottom: 20px;
+        }
+
+        .dropzone:hover, .dropzone.dragover {
+            border-color: var(--primary);
+            background: rgba(0, 242, 254, 0.05);
+        }
+
+        .dropzone i {
+            margin-bottom: 16px;
+            color: var(--primary);
+        }
+
+        #fileInput { display: none; }
+
+        /* Buttons */
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 14px 28px;
+            border-radius: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: none;
+            font-family: inherit;
+            font-size: 1rem;
+            width: 100%;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--secondary), var(--primary));
+            color: #000;
+            box-shadow: 0 10px 20px -5px rgba(0, 242, 254, 0.4);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 30px -5px rgba(0, 242, 254, 0.6);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Status & Progress */
+        .status-container {
+            margin-top: 30px;
+            display: none;
+        }
+
+        .progress-bar-bg {
+            height: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+            box-shadow: 0 0 10px var(--primary);
+        }
+
+        .log-area {
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            max-height: 200px;
+            overflow-y: auto;
+            color: var(--text-muted);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .log-entry { margin-bottom: 4px; }
+        .log-entry.success { color: var(--success); }
+        .log-entry.info { color: var(--primary); }
+
+        /* Results */
+        .results-area {
+            margin-top: 40px;
+            display: none;
+        }
+
+        .download-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+
+        .download-btn {
+            flex: 1;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            color: white;
+            text-decoration: none;
+            text-align: center;
+            font-size: 0.9rem;
+            transition: 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 5px;
+        }
+
+        .download-btn:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: var(--primary);
+        }
+
+        /* Tips Card */
+        .tip-card {
+            border-left: 4px solid var(--primary);
+        }
+
+        .tip-card h3 {
+            font-size: 1.1rem;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .tip-content {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+
+        .amd-badge {
+            display: inline-block;
+            background: linear-gradient(90deg, #ED1C24, #B11226);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.7rem;
+            font-weight: 800;
+            vertical-align: middle;
+            margin-right: 5px;
+        }
+
+        /* Animations */
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            50% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+
+        .status-pulse {
+            animation: pulse 2s infinite;
+            color: var(--primary);
+            font-weight: 600;
+        }
+
+        /* Transcript Preview */
+        .transcript-preview {
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .transcript-seg {
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .ts { color: var(--secondary); font-size: 0.8rem; margin-right: 10px; font-weight: 600; }
+
+        /* Loader */
+        .loader {
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            display: none;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Python STT Pro</h1>
+            <p class="subtitle">High-Performance Whisper Transcription Engine</p>
+        </header>
+
+        <div class="main-grid">
+            <div class="left-col">
+                <div class="glass-card">
+                    <form id="sttForm">
+                        <div class="form-group">
+                            <label>모델 선택</label>
+                            <select name="model">
+                                <option value="large-v3-turbo">large-v3-turbo (가장 정확 - 이미 설치됨)</option>
+                                <option value="medium">medium (균형)</option>
+                                <option value="small">small (보통)</option>
+                                <option value="base">base (빠름)</option>
+                                <option value="tiny">tiny (매우 빠름)</option>
+                            </select>
+                        </div>
+
+                        <div class="dropzone" id="dropzone">
+                            <i data-lucide="upload-cloud" size="48"></i>
+                            <p id="fileNameDisplay">파일을 드래그하거나 클릭하여 선택하세요</p>
+                            <p style="font-size: 0.8rem; color: var(--text-muted); margin-top: 5px;">MP3, WAV, MP4, M4A 등 지원 (최대 500MB)</p>
+                            <input type="file" id="fileInput" name="file" accept="audio/*,video/*">
+                        </div>
+
+                        <div style="text-align: center; margin: 15px 0; color: var(--text-muted);">OR</div>
+
+                        <div class="form-group">
+                            <label>Google Drive URL</label>
+                            <input type="text" name="gdrive_url" placeholder="https://drive.google.com/file/d/...">
+                        </div>
+
+                        <div class="form-group">
+                            <label>전사 힌트 (Prompt)</label>
+                            <input type="text" name="prompt" placeholder="문맥, 이름, 전문용어 등 (예: '입시 컨설팅 대화')">
+                        </div>
+
+                        <button type="submit" class="btn btn-primary" id="submitBtn">
+                            <i data-lucide="play"></i> 전사 시작하기
+                            <div class="loader" id="btnLoader"></div>
+                        </button>
+                    </form>
+                </div>
+
+                <div class="status-container" id="statusContainer">
+                    <div class="glass-card">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <h3 id="statusLabel">진행 상태</h3>
+                            <span id="statusMessage" class="status-pulse">대기 중...</span>
+                        </div>
+                        <div class="progress-bar-bg">
+                            <div class="progress-bar-fill" id="progressBar"></div>
+                        </div>
+                        <div class="log-area" id="logArea">
+                            <div class="log-entry">세션 시작...</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="results-area" id="resultsArea">
+                    <div class="glass-card">
+                        <h3 style="margin-bottom: 20px; display: flex; align-items: center; gap: 10px;">
+                            <i data-lucide="check-circle" color="var(--success)"></i> 전사 결과
+                        </h3>
+                        
+                        <div id="langInfo" style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 15px;"></div>
+
+                        <div class="transcript-preview" id="transcriptPreview">
+                            <!-- Segments will appear here -->
+                        </div>
+
+                        <div class="download-buttons">
+                            <a href="#" id="dl-txt" class="download-btn"><i data-lucide="file-text"></i> TXT</a>
+                            <a href="#" id="dl-srt" class="download-btn"><i data-lucide="subtitles"></i> SRT</a>
+                            <a href="#" id="dl-json" class="download-btn"><i data-lucide="code"></i> JSON</a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="right-col">
+                <div class="glass-card tip-card">
+                    <h3><i data-lucide="zap"></i> AMD 최적화 팁</h3>
+                    <div class="tip-content">
+                        <p style="margin-bottom: 10px;"><span class="amd-badge">AMD</span> <strong>Ryzen™ AI</strong> 프로세서와 <strong>Radeon™</strong> 그래픽카드를 사용 중이시군요!</p>
+                        <ul style="list-style: none;">
+                            <li style="margin-bottom: 8px;">🚀 <strong>CPU Boost:</strong> 현재 설정된 <code>int8</code> 양자화 모델은 Ryzen의 AVX-512 명령어를 활용하여 CPU만으로도 NVIDIA GPU에 필적하는 속도를 냅니다.</li>
+                            <li>🛠️ <strong>그래픽카드 가속:</strong> 현재 Whisper 엔진은 CUDA 전용이나, 차후 DirectML 업데이트를 통해 Radeon 가속이 추가될 예정입니다.</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="glass-card tip-card" style="border-left-color: var(--accent);">
+                    <h3><i data-lucide="info"></i> 사용 가이드</h3>
+                    <div class="tip-content">
+                        <p>1. 파일을 업로드하거나 드라이브 링크를 입력하세요.</p>
+                        <p>2. <strong>'전사 시작하기'</strong>를 클릭하면 실시간으로 텍스트가 표시됩니다.</p>
+                        <p>3. 완료 후 필요한 형식으로 다운로드하세요.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+
+        const form = document.getElementById('sttForm');
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const fileNameDisplay = document.getElementById('fileNameDisplay');
+        const submitBtn = document.getElementById('submitBtn');
+        const btnLoader = document.getElementById('btnLoader');
+        const statusContainer = document.getElementById('statusContainer');
+        const logArea = document.getElementById('logArea');
+        const progressBar = document.getElementById('progressBar');
+        const statusMessage = document.getElementById('statusMessage');
+        const resultsArea = document.getElementById('resultsArea');
+        const transcriptPreview = document.getElementById('transcriptPreview');
+        const langInfo = document.getElementById('langInfo');
+
+        // Drag & Drop
+        dropzone.onclick = () => fileInput.click();
+        dropzone.ondragover = (e) => { e.preventDefault(); dropzone.classList.add('dragover'); };
+        dropzone.ondragleave = () => dropzone.classList.remove('dragover');
+        dropzone.ondrop = (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                fileInput.files = e.dataTransfer.files;
+                updateFileName();
+            }
+        };
+
+        fileInput.onchange = updateFileName;
+
+        function updateFileName() {
+            if (fileInput.files.length) {
+                fileNameDisplay.textContent = fileInput.files[0].name;
+                fileNameDisplay.style.color = 'var(--primary)';
+            }
+        }
+
+        function addLog(msg, type = '') {
+            const div = document.createElement('div');
+            div.className = `log-entry ${type}`;
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logArea.appendChild(div);
+            logArea.scrollTop = logArea.scrollHeight;
+        }
+
+        form.onsubmit = async (e) => {
+            e.preventDefault();
+            
+            const formData = new FormData(form);
+            if (!formData.get('file').name && !formData.get('gdrive_url')) {
+                alert('파일을 선택하거나 Google Drive URL을 입력하세요.');
+                return;
+            }
+
+            // Reset UI
+            submitBtn.disabled = true;
+            btnLoader.style.display = 'block';
+            statusContainer.style.display = 'block';
+            resultsArea.style.display = 'none';
+            logArea.innerHTML = '';
+            transcriptPreview.innerHTML = '';
+            progressBar.style.width = '0%';
+            addLog('작업 요청 전송 중...');
+
+            try {
+                const res = await fetch('/api/transcribe', { method: 'POST', body: formData });
+                const data = await res.json();
+
+                if (data.error) {
+                    addLog(`오류: ${data.error}`, 'error');
+                    resetBtn();
+                    return;
+                }
+
+                const jobId = data.job_id;
+                addLog(`작업 ID 생성됨: ${jobId}`, 'info');
+                startStreaming(jobId);
+
+            } catch (err) {
+                addLog(`연결 오류: ${err.message}`, 'error');
+                resetBtn();
+            }
+        };
+
+        function resetBtn() {
+            submitBtn.disabled = false;
+            btnLoader.style.display = 'none';
+        }
+
+        function startStreaming(jobId) {
+            const eventSource = new EventSource(`/api/stream/${jobId}`);
+            
+            eventSource.onmessage = (e) => {
+                const event = JSON.parse(e.data);
+                
+                if (event.type === 'ping') return;
+
+                if (event.type === 'status') {
+                    statusMessage.textContent = event.data.message;
+                    addLog(event.data.message);
+                    if (event.data.status === 'transcribing') {
+                        progressBar.style.width = '30%';
+                    }
+                }
+
+                if (event.type === 'info') {
+                    langInfo.innerHTML = `감지된 언어: <strong>${event.data.language}</strong> (확률: ${Math.round(event.data.language_probability * 100)}%) | 길이: ${event.data.duration}초`;
+                }
+
+                if (event.type === 'segment') {
+                    resultsArea.style.display = 'block';
+                    const seg = event.data;
+                    const div = document.createElement('div');
+                    div.className = 'transcript-seg';
+                    div.innerHTML = `<span class="ts">[${seg.start}s]</span> ${seg.text}`;
+                    transcriptPreview.appendChild(div);
+                    transcriptPreview.scrollTop = transcriptPreview.scrollHeight;
+                    
+                    // Simple progress fake for segments
+                    let currentWidth = parseFloat(progressBar.style.width);
+                    if (currentWidth < 95) progressBar.style.width = (currentWidth + 1) + '%';
+                }
+
+                if (event.type === 'done') {
+                    addLog(event.data.message, 'success');
+                    statusMessage.textContent = '완료됨';
+                    statusMessage.classList.remove('status-pulse');
+                    progressBar.style.width = '100%';
+                    eventSource.close();
+                    resetBtn();
+                    setupDownloads(jobId);
+                }
+
+                if (event.type === 'error') {
+                    addLog(`실패: ${event.data.message}`, 'error');
+                    statusMessage.textContent = '오류 발생';
+                    eventSource.close();
+                    resetBtn();
+                }
+            };
+
+            eventSource.onerror = () => {
+                addLog('스트리밍 연결 끊김 (서버 처리 중일 수 있음)', 'warning');
+                eventSource.close();
+            };
+        }
+
+        function setupDownloads(jobId) {
+            document.getElementById('dl-txt').href = `/api/download/${jobId}/txt`;
+            document.getElementById('dl-srt').href = `/api/download/${jobId}/srt`;
+            document.getElementById('dl-json').href = `/api/download/${jobId}/json`;
+        }
+    </script>
+</body>
+</html>

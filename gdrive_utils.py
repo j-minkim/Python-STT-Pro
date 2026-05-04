@@ -11,8 +11,8 @@ def download_from_gdrive(url, output_path):
     """
     try:
         console.print(f"Downloading from Google Drive: [cyan]{url}[/cyan]")
-        # gdown.download can handle fuzzy URLs and extracting the ID
-        path = gdown.download(url, output_path, quiet=False, fuzzy=True)
+        # gdown.download handles common URL formats automatically
+        path = gdown.download(url, output_path, quiet=False)
         
         if path:
             console.print(f"[bold green]Download successful:[/bold green] {path}")
