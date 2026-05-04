@@ -28,6 +28,31 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+def collect_supported_files(paths):
+    supported = []
+    for path in paths or []:
+        if not path:
+            continue
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                dirs.sort()
+                for filename in sorted(files):
+                    full_path = os.path.join(root, filename)
+                    if allowed_file(full_path):
+                        supported.append(full_path)
+        elif os.path.isfile(path) and allowed_file(path):
+            supported.append(path)
+
+    seen = set()
+    unique_paths = []
+    for path in supported:
+        real_path = os.path.realpath(path)
+        if real_path not in seen:
+            seen.add(real_path)
+            unique_paths.append(path)
+    return unique_paths
+
+
 def push_event(job_id, event_type, data):
     if job_id in job_queues:
         job_queues[job_id].put({'type': event_type, 'data': data})
@@ -41,69 +66,218 @@ def format_srt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def save_outputs(job_id, segments, original_filename='transcript'):
-    base = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
-    stem = os.path.splitext(original_filename)[0] if original_filename else 'transcript'
-
-    txt_path = base + '.txt'
+def write_transcript_files(base_path, segments, json_payload=None):
+    txt_path = base_path + '.txt'
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(seg['text'] for seg in segments))
 
-    srt_path = base + '.srt'
+    srt_path = base_path + '.srt'
     with open(srt_path, 'w', encoding='utf-8') as f:
         for i, seg in enumerate(segments, 1):
             f.write(f"{i}\n{format_srt_time(seg['start'])} --> {format_srt_time(seg['end'])}\n{seg['text']}\n\n")
 
-    json_path = base + '.json'
+    json_path = base_path + '.json'
     with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(segments, f, ensure_ascii=False, indent=2)
+        json.dump(json_payload if json_payload is not None else segments, f, ensure_ascii=False, indent=2)
 
-    return {'txt': txt_path, 'srt': srt_path, 'json': json_path, 'stem': stem}
+    return {'txt': txt_path, 'srt': srt_path, 'json': json_path}
+
+
+def save_outputs(job_id, segments, original_filename='transcript'):
+    base = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
+    stem = os.path.splitext(original_filename)[0] if original_filename else 'transcript'
+    paths = write_transcript_files(base, segments)
+    return {**paths, 'stem': stem}
+
+
+def output_stem_for_file(filename, index):
+    stem = secure_filename(os.path.splitext(os.path.basename(filename))[0])
+    return f"{index:03d}_{stem or 'transcript'}"
+
+
+def save_file_outputs(job_id, file_result, index):
+    output_dir = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
+    os.makedirs(output_dir, exist_ok=True)
+
+    stem = output_stem_for_file(file_result['filename'], index)
+    base = os.path.join(output_dir, stem)
+    payload = {
+        'filename': file_result['filename'],
+        'info': file_result.get('info'),
+        'segments': file_result['segments'],
+    }
+    paths = write_transcript_files(base, file_result['segments'], json_payload=payload)
+    return {**paths, 'stem': stem}
+
+
+def public_file_downloads(job_id, index):
+    return {
+        fmt: f"/api/download/{job_id}/file/{index}/{fmt}"
+        for fmt in ('txt', 'srt', 'json')
+    }
+
+
+def load_engine(job_id, model_size):
+    push_event(job_id, 'status', {'status': 'loading', 'message': f'모델 로딩 중: {model_size}...'})
+    jobs[job_id]['status'] = 'loading'
+
+    from stt_engine import STTEngine
+    engine = STTEngine(model_size=model_size, device=None, compute_type=None)
+    engine.load_model()
+    return engine
+
+
+def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filename=None, file_index=None, file_total=None):
+    display_name = filename or os.path.basename(audio_path)
+    if file_index and file_total:
+        message = f'[{file_index}/{file_total}] {display_name} 전사 진행 중...'
+    else:
+        message = '전사 진행 중...'
+
+    push_event(job_id, 'status', {'status': 'transcribing', 'message': message})
+    jobs[job_id]['status'] = 'transcribing'
+
+    segments_gen, info = engine.model.transcribe(
+        audio_path,
+        beam_size=5,
+        language=language if language else None,
+        initial_prompt=prompt if prompt else None,
+        condition_on_previous_text=True,
+    )
+
+    lang_info = {
+        'language': info.language,
+        'language_probability': round(info.language_probability, 2),
+        'duration': round(info.duration, 1),
+        'filename': display_name,
+    }
+    if file_index and file_total:
+        lang_info['file_index'] = file_index
+        lang_info['total_files'] = file_total
+    push_event(job_id, 'info', lang_info)
+
+    results = []
+    for segment in segments_gen:
+        seg_data = {
+            'start': round(segment.start, 2),
+            'end': round(segment.end, 2),
+            'text': segment.text.strip()
+        }
+        if file_index and file_total:
+            seg_data['filename'] = display_name
+            seg_data['file_index'] = file_index
+            seg_data['total_files'] = file_total
+        results.append(seg_data)
+        push_event(job_id, 'segment', seg_data)
+
+    return {
+        'filename': display_name,
+        'segments': results,
+        'info': lang_info,
+    }
 
 
 def run_transcription_job(job_id, audio_path, model_size, language, prompt, original_filename=''):
     try:
-        push_event(job_id, 'status', {'status': 'loading', 'message': f'모델 로딩 중: {model_size}...'})
-        jobs[job_id]['status'] = 'loading'
+        engine = load_engine(job_id, model_size)
+        result = transcribe_with_engine(job_id, engine, audio_path, language, prompt, original_filename)
 
-        from stt_engine import STTEngine
-        engine = STTEngine(model_size=model_size, device=None, compute_type=None)
-        engine.load_model()
-
-        push_event(job_id, 'status', {'status': 'transcribing', 'message': '전사 진행 중...'})
-        jobs[job_id]['status'] = 'transcribing'
-
-        segments_gen, info = engine.model.transcribe(
-            audio_path,
-            beam_size=5,
-            language=language if language else None,
-            initial_prompt=prompt if prompt else None,
-            condition_on_previous_text=True,
-        )
-
-        lang_info = {
-            'language': info.language,
-            'language_probability': round(info.language_probability, 2),
-            'duration': round(info.duration, 1)
-        }
-        push_event(job_id, 'info', lang_info)
-        jobs[job_id]['info'] = lang_info
-
-        results = []
-        for segment in segments_gen:
-            seg_data = {
-                'start': round(segment.start, 2),
-                'end': round(segment.end, 2),
-                'text': segment.text.strip()
-            }
-            results.append(seg_data)
-            push_event(job_id, 'segment', seg_data)
-
-        jobs[job_id]['segments'] = results
-        output_paths = save_outputs(job_id, results, original_filename)
+        jobs[job_id]['segments'] = result['segments']
+        jobs[job_id]['info'] = result['info']
+        output_paths = save_outputs(job_id, result['segments'], original_filename)
         jobs[job_id]['outputs'] = output_paths
         jobs[job_id]['status'] = 'done'
-        push_event(job_id, 'done', {'message': '전사 완료!', 'total_segments': len(results)})
+        push_event(job_id, 'done', {'message': '전사 완료!', 'total_segments': len(result['segments'])})
+
+    except Exception as e:
+        jobs[job_id]['status'] = 'error'
+        jobs[job_id]['error'] = str(e)
+        push_event(job_id, 'error', {'message': str(e)})
+
+
+def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch'):
+    try:
+        if not audio_paths:
+            raise ValueError('폴더 안에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.')
+
+        push_event(job_id, 'batch', {'total_files': len(audio_paths)})
+        jobs[job_id]['status'] = 'batch'
+
+        engine = load_engine(job_id, model_size)
+        file_results = []
+        failures = []
+        total_files = len(audio_paths)
+
+        for index, audio_path in enumerate(audio_paths, 1):
+            filename = os.path.basename(audio_path)
+            push_event(job_id, 'file', {
+                'filename': filename,
+                'file_index': index,
+                'total_files': total_files,
+            })
+            try:
+                result = transcribe_with_engine(
+                    job_id,
+                    engine,
+                    audio_path,
+                    language,
+                    prompt,
+                    filename,
+                    file_index=index,
+                    file_total=total_files,
+                )
+                outputs = save_file_outputs(job_id, result, index)
+                result['outputs'] = outputs
+                result['download_urls'] = public_file_downloads(job_id, index)
+                file_results.append(result)
+                push_event(job_id, 'file_done', {
+                    'filename': filename,
+                    'file_index': index,
+                    'total_files': total_files,
+                    'segments': len(result['segments']),
+                    'downloads': result['download_urls'],
+                })
+            except Exception as e:
+                failure = {
+                    'filename': filename,
+                    'file_index': index,
+                    'total_files': total_files,
+                    'error': str(e),
+                }
+                failures.append(failure)
+                push_event(job_id, 'file_error', failure)
+
+        if not file_results:
+            raise ValueError('폴더 내 파일 전사가 모두 실패했습니다.')
+
+        all_segments = [seg for file_result in file_results for seg in file_result['segments']]
+        jobs[job_id]['segments'] = all_segments
+        jobs[job_id]['files'] = file_results
+        jobs[job_id]['failures'] = failures
+        jobs[job_id]['outputs'] = {
+            'type': 'batch',
+            'directory': os.path.join(app.config['OUTPUT_FOLDER'], job_id),
+            'files': [
+                {
+                    'filename': file_result['filename'],
+                    'outputs': file_result['outputs'],
+                    'download_urls': file_result['download_urls'],
+                }
+                for file_result in file_results
+            ],
+        }
+        jobs[job_id]['status'] = 'done'
+
+        message = f"배치 전사 완료: 성공 {len(file_results)}개"
+        if failures:
+            message += f", 실패 {len(failures)}개"
+        push_event(job_id, 'done', {
+            'message': message,
+            'total_files': total_files,
+            'successful_files': len(file_results),
+            'failed_files': len(failures),
+            'total_segments': len(all_segments),
+        })
 
     except Exception as e:
         jobs[job_id]['status'] = 'error'
@@ -152,9 +326,37 @@ def transcribe():
             try:
                 push_event(job_id, 'status', {'status': 'downloading', 'message': 'Google Drive에서 다운로드 중...'})
                 jobs[job_id]['status'] = 'downloading'
-                from gdrive_utils import download_from_gdrive, is_gdrive_url
+                from gdrive_utils import (
+                    download_folder_from_gdrive,
+                    download_from_gdrive,
+                    is_gdrive_folder_url,
+                    is_gdrive_url,
+                )
                 if not is_gdrive_url(gdrive_url):
                     raise ValueError('유효한 Google Drive URL이 아닙니다.')
+
+                if is_gdrive_folder_url(gdrive_url):
+                    download_dir = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_gdrive_folder")
+                    downloaded_paths = download_folder_from_gdrive(gdrive_url, download_dir)
+                    audio_paths = collect_supported_files(downloaded_paths)
+                    if not audio_paths:
+                        audio_paths = collect_supported_files([download_dir])
+                    if not audio_paths:
+                        raise ValueError('Google Drive 폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.')
+                    push_event(job_id, 'status', {
+                        'status': 'queued',
+                        'message': f'폴더에서 {len(audio_paths)}개 파일을 찾았습니다.',
+                    })
+                    run_batch_transcription_job(
+                        job_id,
+                        audio_paths,
+                        model_size,
+                        language,
+                        prompt,
+                        batch_name='gdrive_folder_batch',
+                    )
+                    return
+
                 temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_gdrive.mp3")
                 audio_path = download_from_gdrive(gdrive_url, temp_path)
                 if not audio_path:
@@ -211,6 +413,30 @@ def download(job_id, fmt):
     return send_file(file_path, as_attachment=True, download_name=f"{stem}.{fmt}")
 
 
+@app.route('/api/download/<job_id>/file/<int:file_index>/<fmt>')
+def download_batch_file(job_id, file_index, fmt):
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    job = jobs[job_id]
+    if job['status'] != 'done':
+        return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
+    if fmt not in ('txt', 'srt', 'json'):
+        return jsonify({'error': '지원하지 않는 형식'}), 400
+
+    files = job.get('files') or []
+    if file_index < 1 or file_index > len(files):
+        return jsonify({'error': '파일 번호를 찾을 수 없습니다.'}), 404
+
+    file_result = files[file_index - 1]
+    outputs = file_result.get('outputs') or {}
+    file_path = outputs.get(fmt)
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({'error': '파일 없음'}), 404
+
+    stem = outputs.get('stem') or output_stem_for_file(file_result['filename'], file_index)
+    return send_file(file_path, as_attachment=True, download_name=f"{stem}.{fmt}")
+
+
 @app.route('/api/status/<job_id>')
 def status(job_id):
     if job_id not in jobs:
@@ -220,6 +446,7 @@ def status(job_id):
         'status': job['status'],
         'segments_count': len(job.get('segments', [])),
         'info': job.get('info'),
+        'outputs': job.get('outputs'),
         'error': job.get('error'),
     })
 

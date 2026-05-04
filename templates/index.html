@@ -253,6 +253,45 @@
             background: rgba(255, 255, 255, 0.1);
             border-color: var(--primary);
         }
+        .file-downloads {
+            display: grid;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        .file-download-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 12px;
+            align-items: center;
+            padding: 12px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.03);
+        }
+        .file-download-name {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            color: var(--text);
+            font-weight: 600;
+        }
+        .file-download-links {
+            display: flex;
+            gap: 8px;
+        }
+        .file-download-links a {
+            padding: 6px 10px;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text);
+            text-decoration: none;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .file-download-links a:hover {
+            background: rgba(0, 242, 254, 0.14);
+            color: var(--primary);
+        }
 
         /* Tips Card */
         .tip-card {
@@ -320,6 +359,21 @@
         }
 
         .ts { color: var(--secondary); font-size: 0.8rem; margin-right: 10px; font-weight: 600; }
+        .file-tag {
+            display: inline-block;
+            margin-right: 8px;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(79, 172, 254, 0.12);
+            color: var(--primary);
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .file-header {
+            margin: 16px 0 8px;
+            color: var(--primary);
+            font-weight: 600;
+        }
 
         /* Loader */
         .loader {
@@ -352,6 +406,7 @@
                             <label>모델 선택</label>
                             <select name="model">
                                 <option value="large-v3-turbo">large-v3-turbo (가장 정확 - 이미 설치됨)</option>
+                                <option value="large-v2">large-v2 (Whisper v2 - 안정형)</option>
                                 <option value="medium">medium (균형)</option>
                                 <option value="small">small (보통)</option>
                                 <option value="base">base (빠름)</option>
@@ -370,7 +425,7 @@
 
                         <div class="form-group">
                             <label>Google Drive URL</label>
-                            <input type="text" name="gdrive_url" placeholder="https://drive.google.com/file/d/...">
+                            <input type="text" name="gdrive_url" placeholder="파일 또는 폴더 링크: https://drive.google.com/drive/folders/...">
                         </div>
 
                         <div class="form-group">
@@ -417,6 +472,7 @@
                             <a href="#" id="dl-srt" class="download-btn"><i data-lucide="subtitles"></i> SRT</a>
                             <a href="#" id="dl-json" class="download-btn"><i data-lucide="code"></i> JSON</a>
                         </div>
+                        <div class="file-downloads" id="fileDownloads"></div>
                     </div>
                 </div>
             </div>
@@ -436,7 +492,7 @@
                 <div class="glass-card tip-card" style="border-left-color: var(--accent);">
                     <h3><i data-lucide="info"></i> 사용 가이드</h3>
                     <div class="tip-content">
-                        <p>1. 파일을 업로드하거나 드라이브 링크를 입력하세요.</p>
+                        <p>1. 파일을 업로드하거나 드라이브 파일/폴더 링크를 입력하세요.</p>
                         <p>2. <strong>'전사 시작하기'</strong>를 클릭하면 실시간으로 텍스트가 표시됩니다.</p>
                         <p>3. 완료 후 필요한 형식으로 다운로드하세요.</p>
                     </div>
@@ -461,6 +517,9 @@
         const resultsArea = document.getElementById('resultsArea');
         const transcriptPreview = document.getElementById('transcriptPreview');
         const langInfo = document.getElementById('langInfo');
+        const downloadButtons = document.querySelector('.download-buttons');
+        const fileDownloads = document.getElementById('fileDownloads');
+        let currentIsBatch = false;
 
         // Drag & Drop
         dropzone.onclick = () => fileInput.click();
@@ -492,6 +551,32 @@
             logArea.scrollTop = logArea.scrollHeight;
         }
 
+        function escapeHtml(value) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return String(value ?? '').replace(/[&<>"']/g, (char) => map[char]);
+        }
+
+        function addFileDownloads(fileData) {
+            if (!fileData.downloads) return;
+            const row = document.createElement('div');
+            row.className = 'file-download-row';
+            row.innerHTML = `
+                <div class="file-download-name" title="${escapeHtml(fileData.filename)}">${escapeHtml(fileData.filename)}</div>
+                <div class="file-download-links">
+                    <a href="${escapeHtml(fileData.downloads.txt)}">TXT</a>
+                    <a href="${escapeHtml(fileData.downloads.srt)}">SRT</a>
+                    <a href="${escapeHtml(fileData.downloads.json)}">JSON</a>
+                </div>
+            `;
+            fileDownloads.appendChild(row);
+        }
+
         form.onsubmit = async (e) => {
             e.preventDefault();
             
@@ -508,7 +593,11 @@
             resultsArea.style.display = 'none';
             logArea.innerHTML = '';
             transcriptPreview.innerHTML = '';
+            fileDownloads.innerHTML = '';
+            downloadButtons.style.display = 'flex';
             progressBar.style.width = '0%';
+            statusMessage.classList.add('status-pulse');
+            currentIsBatch = false;
             addLog('작업 요청 전송 중...');
 
             try {
@@ -552,8 +641,27 @@
                     }
                 }
 
+                if (event.type === 'batch') {
+                    currentIsBatch = true;
+                    downloadButtons.style.display = 'none';
+                    addLog(`배치 작업 시작: ${event.data.total_files}개 파일`, 'info');
+                    progressBar.style.width = '10%';
+                }
+
+                if (event.type === 'file') {
+                    resultsArea.style.display = 'block';
+                    const fileHeader = document.createElement('div');
+                    fileHeader.className = 'file-header';
+                    fileHeader.textContent = `[${event.data.file_index}/${event.data.total_files}] ${event.data.filename}`;
+                    transcriptPreview.appendChild(fileHeader);
+                    addLog(`파일 처리 시작: ${event.data.filename}`, 'info');
+                    const progress = 10 + ((event.data.file_index - 1) / event.data.total_files) * 80;
+                    progressBar.style.width = `${Math.min(progress, 90)}%`;
+                }
+
                 if (event.type === 'info') {
-                    langInfo.innerHTML = `감지된 언어: <strong>${event.data.language}</strong> (확률: ${Math.round(event.data.language_probability * 100)}%) | 길이: ${event.data.duration}초`;
+                    const fileLabel = event.data.filename ? `${escapeHtml(event.data.filename)} · ` : '';
+                    langInfo.innerHTML = `${fileLabel}감지된 언어: <strong>${escapeHtml(event.data.language)}</strong> (확률: ${Math.round(event.data.language_probability * 100)}%) | 길이: ${event.data.duration}초`;
                 }
 
                 if (event.type === 'segment') {
@@ -561,13 +669,23 @@
                     const seg = event.data;
                     const div = document.createElement('div');
                     div.className = 'transcript-seg';
-                    div.innerHTML = `<span class="ts">[${seg.start}s]</span> ${seg.text}`;
+                    const fileTag = seg.filename ? `<span class="file-tag">${escapeHtml(seg.filename)}</span>` : '';
+                    div.innerHTML = `${fileTag}<span class="ts">[${escapeHtml(seg.start)}s]</span> ${escapeHtml(seg.text)}`;
                     transcriptPreview.appendChild(div);
                     transcriptPreview.scrollTop = transcriptPreview.scrollHeight;
                     
                     // Simple progress fake for segments
                     let currentWidth = parseFloat(progressBar.style.width);
                     if (currentWidth < 95) progressBar.style.width = (currentWidth + 1) + '%';
+                }
+
+                if (event.type === 'file_done') {
+                    addLog(`파일 완료: ${event.data.filename} (${event.data.segments}개 구간)`, 'success');
+                    addFileDownloads(event.data);
+                }
+
+                if (event.type === 'file_error') {
+                    addLog(`파일 실패: ${event.data.filename} - ${event.data.error}`, 'error');
                 }
 
                 if (event.type === 'done') {
@@ -577,7 +695,7 @@
                     progressBar.style.width = '100%';
                     eventSource.close();
                     resetBtn();
-                    setupDownloads(jobId);
+                    if (!currentIsBatch) setupDownloads(jobId);
                 }
 
                 if (event.type === 'error') {
