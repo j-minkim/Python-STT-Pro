@@ -21,26 +21,60 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 jobs = {}
 job_queues = {}
 
-ALLOWED_EXTENSIONS = {'mp3', 'wav', 'mp4', 'm4a', 'ogg', 'flac', 'webm', 'aac', 'wma'}
+ALLOWED_EXTENSIONS = {
+    'mp3', 'wav', 'mp4', 'm4a', 'ogg', 'flac', 'webm', 'aac', 'wma',
+    'mov', 'm4v', 'mkv', 'avi',
+}
 
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-def collect_supported_files(paths):
-    supported = []
+def looks_like_supported_media(path):
+    if allowed_file(path):
+        return True
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False
+
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(64)
+    except OSError:
+        return False
+
+    if len(header) >= 12 and header[4:8] == b'ftyp':
+        return True
+    if header.startswith((b'ID3', b'OggS', b'fLaC')):
+        return True
+    if len(header) >= 12 and header.startswith(b'RIFF') and header[8:12] == b'WAVE':
+        return True
+    if header.startswith(b'\x1a\x45\xdf\xa3'):
+        return True
+    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
+        return True
+    return False
+
+
+def list_downloaded_files(paths):
+    files = []
     for path in paths or []:
         if not path:
             continue
         if os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
+            for root, dirs, filenames in os.walk(path):
                 dirs.sort()
-                for filename in sorted(files):
-                    full_path = os.path.join(root, filename)
-                    if allowed_file(full_path):
-                        supported.append(full_path)
-        elif os.path.isfile(path) and allowed_file(path):
+                for filename in sorted(filenames):
+                    files.append(os.path.join(root, filename))
+        elif os.path.isfile(path):
+            files.append(path)
+    return files
+
+
+def collect_supported_files(paths):
+    supported = []
+    for path in list_downloaded_files(paths):
+        if looks_like_supported_media(path):
             supported.append(path)
 
     seen = set()
@@ -338,14 +372,23 @@ def transcribe():
                 if is_gdrive_folder_url(gdrive_url):
                     download_dir = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_gdrive_folder")
                     downloaded_paths = download_folder_from_gdrive(gdrive_url, download_dir)
+                    downloaded_files = list_downloaded_files([download_dir])
                     audio_paths = collect_supported_files(downloaded_paths)
                     if not audio_paths:
                         audio_paths = collect_supported_files([download_dir])
                     if not audio_paths:
-                        raise ValueError('Google Drive 폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.')
+                        downloaded_names = ', '.join(
+                            os.path.basename(path) or path
+                            for path in downloaded_files[:10]
+                        )
+                        detail = f' 내려받은 파일: {downloaded_names}' if downloaded_names else ''
+                        raise ValueError(
+                            'Google Drive 폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.'
+                            + detail
+                        )
                     push_event(job_id, 'status', {
                         'status': 'queued',
-                        'message': f'폴더에서 {len(audio_paths)}개 파일을 찾았습니다.',
+                        'message': f'폴더에서 전사 대상 {len(audio_paths)}개를 찾았습니다. 다운로드 파일 {len(downloaded_files)}개.',
                     })
                     run_batch_transcription_job(
                         job_id,
