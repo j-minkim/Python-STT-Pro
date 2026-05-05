@@ -1,6 +1,7 @@
 import gdown
 import os
 import re
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlunparse
 from rich.console import Console
 
@@ -48,36 +49,103 @@ def normalize_gdrive_folder_url(url):
     return urlunparse(("https", "drive.google.com", f"/drive/folders/{folder_id}", "", clean_query, ""))
 
 
+def _download_gdrive_file_by_id(file_id, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    return gdown.download(
+        url=f"https://drive.google.com/uc?id={file_id}",
+        output=output_path,
+        quiet=False,
+        fuzzy=False,
+        resume=True,
+    )
+
+
+def _folder_item_path(item):
+    local_path = getattr(item, "local_path", None)
+    if local_path:
+        return local_path
+
+    path = getattr(item, "path", None)
+    if path:
+        return path
+
+    return str(item)
+
+
+def _folder_item_id(item):
+    return getattr(item, "id", None)
+
+
+def list_gdrive_folder_files(url, output_dir):
+    normalized_url = normalize_gdrive_folder_url(url)
+    console.print(f"Listing Google Drive folder: [cyan]{normalized_url}[/cyan]")
+    files = gdown.download_folder(
+        url=normalized_url,
+        output=output_dir,
+        quiet=False,
+        remaining_ok=True,
+        skip_download=True,
+    )
+
+    if files is None:
+        raise RuntimeError(
+            "Google Drive 폴더 목록을 가져오지 못했습니다. "
+            "폴더 공유 권한이 '링크가 있는 모든 사용자'인지 확인해 주세요."
+        )
+
+    if len(files) == 0:
+        raise RuntimeError(
+            "Google Drive 폴더 목록은 열렸지만 파일이 없습니다. "
+            "폴더가 비어 있거나 실제 파일 대신 바로가기만 있을 수 있습니다."
+        )
+
+    console.print(f"[bold green]Folder listing successful:[/bold green] {len(files)} files")
+    return normalized_url, files
+
+
 def download_folder_from_gdrive(url, output_dir):
     """
     Download every file from a Google Drive public folder link.
-    Returns the list of downloaded paths reported by gdown.
+    Returns the local paths that were actually downloaded.
     """
     try:
         os.makedirs(output_dir, exist_ok=True)
-        normalized_url = normalize_gdrive_folder_url(url)
-        console.print(f"Downloading Google Drive folder: [cyan]{normalized_url}[/cyan]")
-        paths = gdown.download_folder(
-            url=normalized_url,
-            output=output_dir,
-            quiet=False,
-            remaining_ok=True,
-            resume=True,
-        )
+        normalized_url, listed_files = list_gdrive_folder_files(url, output_dir)
+        console.print(f"Downloading Google Drive folder files: [cyan]{normalized_url}[/cyan]")
 
-        if paths is None:
-            raise RuntimeError(
-                "Google Drive 폴더 목록을 가져오거나 다운로드하지 못했습니다. "
-                "폴더 공유 권한이 '링크가 있는 모든 사용자'인지 확인해 주세요."
+        downloaded_paths = []
+        failed_names = []
+        output_root = Path(output_dir).resolve()
+
+        for index, item in enumerate(listed_files, 1):
+            file_id = _folder_item_id(item)
+            local_path = Path(_folder_item_path(item))
+            if not local_path.is_absolute():
+                local_path = output_root / local_path
+
+            display_name = getattr(item, "path", None) or local_path.name
+            if not file_id:
+                failed_names.append(display_name)
+                console.print(f"[yellow]Skipping item without file id:[/yellow] {display_name}")
+                continue
+
+            console.print(f"[{index}/{len(listed_files)}] Downloading: [cyan]{display_name}[/cyan]")
+            downloaded = _download_gdrive_file_by_id(file_id, str(local_path))
+            if downloaded:
+                downloaded_paths.append(downloaded)
+            else:
+                failed_names.append(display_name)
+
+        if downloaded_paths:
+            console.print(
+                f"[bold green]Folder download successful:[/bold green] "
+                f"{len(downloaded_paths)}/{len(listed_files)} files"
             )
-
-        if len(paths) > 0:
-            console.print(f"[bold green]Folder download successful:[/bold green] {len(paths)} files")
-            return paths
+            return downloaded_paths
 
         raise RuntimeError(
-            "Google Drive 폴더에서 다운로드할 파일을 찾지 못했습니다. "
-            "폴더가 비어 있거나, 파일이 바로가기/권한 제한 상태일 수 있습니다."
+            "Google Drive 폴더 목록은 열렸지만 파일 다운로드가 모두 실패했습니다. "
+            f"실패 파일: {', '.join(failed_names[:10])}"
         )
     except Exception as e:
         console.print(f"[red]Error during folder download:[/red] {str(e)}")
