@@ -20,6 +20,7 @@ os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 jobs = {}
 job_queues = {}
+folder_sessions = {}
 
 ALLOWED_EXTENSIONS = {
     'mp3', 'wav', 'mp4', 'm4a', 'ogg', 'flac', 'webm', 'aac', 'wma',
@@ -151,6 +152,66 @@ def public_file_downloads(job_id, index):
     }
 
 
+def folder_item_to_record(item, index):
+    file_id = getattr(item, "id", None)
+    item_path = getattr(item, "path", None) or getattr(item, "local_path", None) or f"file_{index}"
+    item_path = str(item_path)
+    filename = os.path.basename(item_path) or item_path
+    extension = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+
+    return {
+        'id': file_id,
+        'index': index,
+        'path': item_path,
+        'filename': filename,
+        'extension': extension,
+        'supported': allowed_file(filename),
+    }
+
+
+def safe_download_name(filename, index):
+    safe_name = secure_filename(os.path.basename(filename))
+    if not safe_name:
+        safe_name = f"gdrive_file_{index}"
+    return f"{index:03d}_{safe_name}"
+
+
+def download_selected_gdrive_files(job_id, session, selected_file_ids):
+    selected = set(selected_file_ids)
+    selected_records = [
+        record for record in session['files']
+        if record['id'] in selected
+    ]
+    if not selected_records:
+        raise ValueError('선택된 Google Drive 파일이 없습니다.')
+
+    from gdrive_utils import download_gdrive_file_by_id
+
+    download_dir = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_gdrive_selected")
+    os.makedirs(download_dir, exist_ok=True)
+
+    downloaded_paths = []
+    display_names = {}
+    failures = []
+
+    for index, record in enumerate(selected_records, 1):
+        output_path = os.path.join(download_dir, safe_download_name(record['filename'], index))
+        downloaded = download_gdrive_file_by_id(record['id'], output_path)
+        if downloaded:
+            downloaded_paths.append(downloaded)
+            display_names[downloaded] = record['path']
+        else:
+            failures.append(record['path'])
+
+    if not downloaded_paths:
+        raise ValueError(
+            '선택한 Google Drive 파일 다운로드가 모두 실패했습니다.'
+            + (f" 실패 파일: {', '.join(failures[:10])}" if failures else '')
+        )
+
+    return downloaded_paths, display_names, failures
+
+
 def load_engine(job_id, model_size):
     push_event(job_id, 'status', {'status': 'loading', 'message': f'모델 로딩 중: {model_size}...'})
     jobs[job_id]['status'] = 'loading'
@@ -229,7 +290,7 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         push_event(job_id, 'error', {'message': str(e)})
 
 
-def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch'):
+def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch', display_names=None):
     try:
         if not audio_paths:
             raise ValueError('폴더 안에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.')
@@ -241,9 +302,10 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
         file_results = []
         failures = []
         total_files = len(audio_paths)
+        display_names = display_names or {}
 
         for index, audio_path in enumerate(audio_paths, 1):
-            filename = os.path.basename(audio_path)
+            filename = display_names.get(audio_path, os.path.basename(audio_path))
             push_event(job_id, 'file', {
                 'filename': filename,
                 'file_index': index,
@@ -324,17 +386,124 @@ def index():
     return render_template('index.html')
 
 
+@app.route('/api/gdrive/list', methods=['POST'])
+def list_gdrive_folder():
+    data = request.get_json(silent=True) or request.form
+    gdrive_url = data.get('gdrive_url', '').strip()
+
+    if not gdrive_url:
+        return jsonify({'error': 'Google Drive 폴더 URL을 입력해주세요.'}), 400
+
+    from gdrive_utils import is_gdrive_folder_url, is_gdrive_url, list_gdrive_folder_files
+
+    if not is_gdrive_url(gdrive_url):
+        return jsonify({'error': '유효한 Google Drive URL이 아닙니다.'}), 400
+    if not is_gdrive_folder_url(gdrive_url):
+        return jsonify({'error': '파일 목록 조회는 Google Drive 폴더 링크에서만 지원합니다.'}), 400
+
+    session_id = str(uuid.uuid4())
+    output_dir = os.path.join(app.config['UPLOAD_FOLDER'], f"{session_id}_gdrive_list")
+
+    try:
+        normalized_url, items = list_gdrive_folder_files(gdrive_url, output_dir)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+    files = [
+        folder_item_to_record(item, index)
+        for index, item in enumerate(items, 1)
+    ]
+    files = [record for record in files if record['id']]
+
+    if not files:
+        return jsonify({'error': '폴더 목록은 열렸지만 다운로드 가능한 파일 ID를 찾지 못했습니다.'}), 400
+
+    folder_sessions[session_id] = {
+        'id': session_id,
+        'url': gdrive_url,
+        'normalized_url': normalized_url,
+        'output_dir': output_dir,
+        'files': files,
+        'created_at': time.time(),
+    }
+
+    return jsonify({
+        'session_id': session_id,
+        'normalized_url': normalized_url,
+        'files': files,
+        'total_files': len(files),
+        'supported_files': len([record for record in files if record['supported']]),
+    })
+
+
 @app.route('/api/transcribe', methods=['POST'])
 def transcribe():
     model_size = request.form.get('model', 'large-v3-turbo')
     language = request.form.get('language', '') or None
     prompt = request.form.get('prompt', '') or None
+    folder_session_id = request.form.get('gdrive_folder_session_id', '').strip()
+    selected_file_ids_raw = request.form.get('selected_file_ids', '').strip()
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {'status': 'queued', 'segments': [], 'info': None, 'error': None, 'created_at': time.time()}
     job_queues[job_id] = Queue()
 
-    if 'file' in request.files and request.files['file'].filename:
+    if folder_session_id:
+        session = folder_sessions.get(folder_session_id)
+        if not session:
+            return jsonify({'error': 'Google Drive 폴더 세션을 찾을 수 없습니다. 파일 목록을 다시 불러와 주세요.'}), 400
+
+        try:
+            selected_file_ids = json.loads(selected_file_ids_raw)
+        except json.JSONDecodeError:
+            return jsonify({'error': '선택 파일 목록이 올바르지 않습니다.'}), 400
+
+        if not isinstance(selected_file_ids, list) or not selected_file_ids:
+            return jsonify({'error': '전사할 파일을 하나 이상 선택해주세요.'}), 400
+
+        jobs[job_id]['filename'] = 'gdrive_selected_files'
+
+        def selected_gdrive_job():
+            try:
+                push_event(job_id, 'status', {'status': 'downloading', 'message': '선택한 Google Drive 파일 다운로드 중...'})
+                jobs[job_id]['status'] = 'downloading'
+                downloaded_paths, display_names, failures = download_selected_gdrive_files(job_id, session, selected_file_ids)
+                audio_paths = collect_supported_files(downloaded_paths)
+                if not audio_paths:
+                    downloaded_names = ', '.join(os.path.basename(path) or path for path in downloaded_paths[:10])
+                    raise ValueError(
+                        '선택한 파일을 다운로드했지만 지원하는 오디오/비디오 파일을 찾지 못했습니다.'
+                        + (f' 다운로드 파일: {downloaded_names}' if downloaded_names else '')
+                    )
+
+                if failures:
+                    push_event(job_id, 'status', {
+                        'status': 'queued',
+                        'message': f'다운로드 성공 {len(downloaded_paths)}개, 실패 {len(failures)}개. 성공 파일만 전사합니다.',
+                    })
+                else:
+                    push_event(job_id, 'status', {
+                        'status': 'queued',
+                        'message': f'선택 파일 {len(audio_paths)}개를 전사합니다.',
+                    })
+
+                run_batch_transcription_job(
+                    job_id,
+                    audio_paths,
+                    model_size,
+                    language,
+                    prompt,
+                    batch_name='gdrive_selected_files',
+                    display_names=display_names,
+                )
+            except Exception as e:
+                jobs[job_id]['status'] = 'error'
+                jobs[job_id]['error'] = str(e)
+                push_event(job_id, 'error', {'message': str(e)})
+
+        threading.Thread(target=selected_gdrive_job, daemon=True).start()
+
+    elif 'file' in request.files and request.files['file'].filename:
         file = request.files['file']
         if not allowed_file(file.filename):
             return jsonify({'error': '지원하지 않는 파일 형식입니다.'}), 400

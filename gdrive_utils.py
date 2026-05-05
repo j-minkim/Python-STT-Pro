@@ -49,7 +49,7 @@ def normalize_gdrive_folder_url(url):
     return urlunparse(("https", "drive.google.com", f"/drive/folders/{folder_id}", "", clean_query, ""))
 
 
-def _download_gdrive_file_by_id(file_id, output_path):
+def download_gdrive_file_by_id(file_id, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     return gdown.download(
         url=f"https://drive.google.com/uc?id={file_id}",
@@ -130,7 +130,7 @@ def download_folder_from_gdrive(url, output_dir):
                 continue
 
             console.print(f"[{index}/{len(listed_files)}] Downloading: [cyan]{display_name}[/cyan]")
-            downloaded = _download_gdrive_file_by_id(file_id, str(local_path))
+            downloaded = download_gdrive_file_by_id(file_id, str(local_path))
             if downloaded:
                 downloaded_paths.append(downloaded)
             else:
