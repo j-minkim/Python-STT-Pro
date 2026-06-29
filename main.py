@@ -86,8 +86,8 @@ def main():
             return
 
         engine = get_engine(args.model)
-        word_ts = getattr(args, 'diarize', False) or getattr(args, 'summary', False)
-        results, info = engine.transcribe(args.file, language=args.lang, initial_prompt=args.prompt, word_timestamps=word_ts)
+        # Always capture word timestamps so SRT cues can be split accurately.
+        results, info = engine.transcribe(args.file, language=args.lang, initial_prompt=args.prompt, word_timestamps=True)
         
         diarized_results, summary_text = process_advanced_features(args.file, results)
         
@@ -108,7 +108,7 @@ def main():
         audio_path = record_audio(args.output, duration=args.duration)
         if audio_path:
             engine = get_engine(args.model)
-            results, info = engine.transcribe(audio_path, initial_prompt=args.prompt)
+            results, info = engine.transcribe(audio_path, initial_prompt=args.prompt, word_timestamps=True)
         
         # Result filename in Downloads
         file_name = f"STT_{int(time.time())}"
@@ -127,8 +127,8 @@ def main():
         
         if audio_path:
             engine = get_engine(args.model)
-            word_ts = getattr(args, 'diarize', False) or getattr(args, 'summary', False)
-            results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt, word_timestamps=word_ts)
+            # Always capture word timestamps so SRT cues can be split accurately.
+            results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt, word_timestamps=True)
             
             diarized_results, summary_text = process_advanced_features(audio_path, results)
             
@@ -161,7 +161,7 @@ def main():
                     audio_path = line
 
                 if audio_path and check_file_exists(audio_path):
-                    results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt)
+                    results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt, word_timestamps=True)
                     
                     file_name = f"Batch_STT_{i}_{int(time.time())}"
                     out_base = os.path.join(get_downloads_path(), file_name)

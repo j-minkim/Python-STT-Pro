@@ -1,14 +1,22 @@
 import os
+import re
 import sys
 import json
 import time
 import uuid
+import shutil
 import threading
 from queue import Queue, Empty
 from flask import Flask, request, jsonify, send_file, Response, render_template
 from werkzeug.utils import secure_filename
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
@@ -101,15 +109,214 @@ def format_srt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def write_transcript_files(base_path, segments, json_payload=None):
+def parse_subtitle_opts(form):
+    from output_utils import SUBTITLE_MAX_CHARS, SUBTITLE_MIN_CHARS
+
+    def to_int(name, default):
+        try:
+            return int((form.get(name) or '').strip())
+        except (TypeError, ValueError):
+            return default
+
+    max_chars = to_int('subtitle_max_chars', SUBTITLE_MAX_CHARS)
+    min_chars = to_int('subtitle_min_chars', SUBTITLE_MIN_CHARS)
+    max_chars = max(10, min(max_chars, 200))
+    min_chars = max(0, min(min_chars, max_chars))
+    return {'max_chars': max_chars, 'min_chars': min_chars}
+
+
+def parse_translation_opts(form):
+    """Read translation settings from the request form.
+
+    Languages come from preset checkboxes (`translate_langs`, possibly multiple)
+    and a free-form comma/space separated field (`translate_langs_custom`).
+    """
+    from translator import resolve_language
+
+    backend = (form.get('translate_backend') or 'openai').strip()
+    if backend not in ('openai', 'lmstudio'):
+        backend = 'openai'
+
+    raw_values = []
+    if hasattr(form, 'getlist'):
+        raw_values.extend(form.getlist('translate_langs'))
+    else:
+        single = form.get('translate_langs')
+        if single:
+            raw_values.append(single)
+
+    custom = form.get('translate_langs_custom') or ''
+    raw_values.extend(re.split(r'[,\s]+', custom))
+
+    langs = []
+    seen = set()
+    for raw in raw_values:
+        resolved = resolve_language(raw)
+        if not resolved:
+            continue
+        code, name = resolved
+        if code in seen:
+            continue
+        seen.add(code)
+        langs.append({'code': code, 'name': name})
+
+    return {'enabled': bool(langs), 'backend': backend, 'langs': langs}
+
+
+def run_translations(job_id, segments, base_path, file_index=None):
+    """Translate the job's subtitle cues into each requested language.
+
+    Writes <base>.<code>.srt (translated), <base>.<code>.dual.srt (bilingual),
+    and <base>.<code>.txt for every target language. Returns a dict keyed by
+    language code, or None when translation is disabled. Failures are reported
+    per-language via SSE and never abort the transcription job.
+    """
+    tr = jobs.get(job_id, {}).get('translation') or {}
+    langs = tr.get('langs') or []
+    if not langs:
+        return None
+
+    from output_utils import (
+        split_into_subtitle_cues,
+        write_cue_srt,
+        write_bilingual_srt,
+        write_cue_txt,
+        SUBTITLE_MAX_CHARS,
+        SUBTITLE_MIN_CHARS,
+    )
+    from translator import SubtitleTranslator
+
+    sub = jobs.get(job_id, {}).get('subtitle') or {}
+    max_chars = sub.get('max_chars') or SUBTITLE_MAX_CHARS
+    min_chars = sub.get('min_chars')
+    if min_chars is None:
+        min_chars = SUBTITLE_MIN_CHARS
+    cues = split_into_subtitle_cues(segments, max_chars=max_chars, min_chars=min_chars)
+
+    try:
+        translator = SubtitleTranslator(backend=tr.get('backend', 'openai'))
+    except Exception as e:
+        push_event(job_id, 'translate_error', {'message': str(e), 'file_index': file_index})
+        return None
+
+    results = {}
+    for lang in langs:
+        code, name = lang['code'], lang['name']
+        push_event(job_id, 'translate_status', {
+            'message': f'번역 중: {name}...',
+            'language': name,
+            'code': code,
+            'file_index': file_index,
+        })
+        try:
+            translated = translator.translate_cues(cues, name)
+        except Exception as e:
+            push_event(job_id, 'translate_error', {
+                'message': f'{name} 번역 실패: {e}',
+                'language': name,
+                'code': code,
+                'file_index': file_index,
+            })
+            continue
+
+        srt_path = f"{base_path}.{code}.srt"
+        dual_path = f"{base_path}.{code}.dual.srt"
+        txt_path = f"{base_path}.{code}.txt"
+        write_cue_srt(translated, srt_path)
+        write_bilingual_srt(cues, translated, dual_path)
+        write_cue_txt(translated, txt_path)
+        results[code] = {'name': name, 'srt': srt_path, 'dual': dual_path, 'txt': txt_path}
+
+    return results or None
+
+
+def translation_download_urls(job_id, translations, file_index=None):
+    """Build download URLs for a translations dict produced by run_translations."""
+    urls = {}
+    for code, entry in (translations or {}).items():
+        if file_index is None:
+            base = f"/api/download/{job_id}/translation/{code}"
+        else:
+            base = f"/api/download/{job_id}/file/{file_index}/translation/{code}"
+        urls[code] = {
+            'name': entry['name'],
+            'srt': f"{base}/srt",
+            'dual': f"{base}/dual",
+            'txt': f"{base}/txt",
+        }
+    return urls
+
+
+def _safe_stem(stem):
+    stem = (stem or "transcript").strip()
+    stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem)  # filename-unsafe chars
+    return stem or "transcript"
+
+
+def _unique_path(directory, filename):
+    """Return a path in directory that doesn't clobber an existing file."""
+    base, ext = os.path.splitext(filename)
+    candidate = os.path.join(directory, filename)
+    i = 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(directory, f"{base} ({i}){ext}")
+        i += 1
+    return candidate
+
+
+def export_to_downloads(outputs, translations=None, stem=None):
+    """Copy a job's output files into the user's Downloads folder.
+
+    Names files by the original media stem (not the job UUID) so they're easy to
+    find. Returns the list of copied paths. Disabled by SAVE_TO_DOWNLOADS=0.
+    """
+    if os.getenv("SAVE_TO_DOWNLOADS", "1") not in ("1", "true", "True"):
+        return []
+
+    from output_utils import get_downloads_path
+
+    downloads = get_downloads_path()
+    if not os.path.isdir(downloads):
+        return []
+
+    stem = _safe_stem(stem or (outputs or {}).get("stem"))
+    copied = []
+
+    for fmt in ("txt", "srt", "json"):
+        src = (outputs or {}).get(fmt)
+        if src and os.path.exists(src):
+            dst = _unique_path(downloads, f"{stem}.{fmt}")
+            shutil.copy2(src, dst)
+            copied.append(dst)
+
+    for code, entry in (translations or {}).items():
+        for kind, ext in (("srt", "srt"), ("dual", "dual.srt"), ("txt", "txt")):
+            src = entry.get(kind)
+            if src and os.path.exists(src):
+                dst = _unique_path(downloads, f"{stem}.{code}.{ext}")
+                shutil.copy2(src, dst)
+                copied.append(dst)
+
+    return copied
+
+
+def write_transcript_files(base_path, segments, json_payload=None, max_chars=None, min_chars=None):
+    from output_utils import split_into_subtitle_cues, SUBTITLE_MAX_CHARS, SUBTITLE_MIN_CHARS
+
+    if max_chars is None:
+        max_chars = SUBTITLE_MAX_CHARS
+    if min_chars is None:
+        min_chars = SUBTITLE_MIN_CHARS
+
     txt_path = base_path + '.txt'
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(seg['text'] for seg in segments))
 
     srt_path = base_path + '.srt'
+    cues = split_into_subtitle_cues(segments, max_chars=max_chars, min_chars=min_chars)
     with open(srt_path, 'w', encoding='utf-8') as f:
-        for i, seg in enumerate(segments, 1):
-            f.write(f"{i}\n{format_srt_time(seg['start'])} --> {format_srt_time(seg['end'])}\n{seg['text']}\n\n")
+        for i, cue in enumerate(cues, 1):
+            f.write(f"{i}\n{format_srt_time(cue['start'])} --> {format_srt_time(cue['end'])}\n{cue['text']}\n\n")
 
     json_path = base_path + '.json'
     with open(json_path, 'w', encoding='utf-8') as f:
@@ -121,7 +328,8 @@ def write_transcript_files(base_path, segments, json_payload=None):
 def save_outputs(job_id, segments, original_filename='transcript'):
     base = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
     stem = os.path.splitext(original_filename)[0] if original_filename else 'transcript'
-    paths = write_transcript_files(base, segments)
+    sub = jobs.get(job_id, {}).get('subtitle') or {}
+    paths = write_transcript_files(base, segments, max_chars=sub.get('max_chars'), min_chars=sub.get('min_chars'))
     return {**paths, 'stem': stem}
 
 
@@ -141,7 +349,11 @@ def save_file_outputs(job_id, file_result, index):
         'info': file_result.get('info'),
         'segments': file_result['segments'],
     }
-    paths = write_transcript_files(base, file_result['segments'], json_payload=payload)
+    sub = jobs.get(job_id, {}).get('subtitle') or {}
+    paths = write_transcript_files(
+        base, file_result['segments'], json_payload=payload,
+        max_chars=sub.get('max_chars'), min_chars=sub.get('min_chars'),
+    )
     return {**paths, 'stem': stem}
 
 
@@ -238,6 +450,7 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
         language=language if language else None,
         initial_prompt=prompt if prompt else None,
         condition_on_previous_text=True,
+        word_timestamps=True,
     )
 
     lang_info = {
@@ -253,17 +466,27 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
 
     results = []
     for segment in segments_gen:
+        words = []
+        for word in getattr(segment, 'words', None) or []:
+            words.append({
+                'start': round(word.start, 2) if word.start is not None else None,
+                'end': round(word.end, 2) if word.end is not None else None,
+                'text': word.word.strip(),
+            })
+
         seg_data = {
             'start': round(segment.start, 2),
             'end': round(segment.end, 2),
-            'text': segment.text.strip()
+            'text': segment.text.strip(),
+            'words': words,
         }
         if file_index and file_total:
             seg_data['filename'] = display_name
             seg_data['file_index'] = file_index
             seg_data['total_files'] = file_total
         results.append(seg_data)
-        push_event(job_id, 'segment', seg_data)
+        # Keep the live stream light: drop word-level detail from the UI event.
+        push_event(job_id, 'segment', {k: v for k, v in seg_data.items() if k != 'words'})
 
     return {
         'filename': display_name,
@@ -281,6 +504,21 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         jobs[job_id]['info'] = result['info']
         output_paths = save_outputs(job_id, result['segments'], original_filename)
         jobs[job_id]['outputs'] = output_paths
+
+        translations = run_translations(
+            job_id, result['segments'], os.path.join(app.config['OUTPUT_FOLDER'], job_id)
+        )
+        if translations:
+            jobs[job_id]['translations'] = translations
+            push_event(job_id, 'translations', {
+                'scope': 'single',
+                'items': translation_download_urls(job_id, translations),
+            })
+
+        saved = export_to_downloads(output_paths, translations, stem=output_paths.get('stem'))
+        if saved:
+            push_event(job_id, 'saved', {'count': len(saved), 'directory': os.path.dirname(saved[0])})
+
         jobs[job_id]['status'] = 'done'
         push_event(job_id, 'done', {'message': '전사 완료!', 'total_segments': len(result['segments'])})
 
@@ -325,6 +563,15 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 outputs = save_file_outputs(job_id, result, index)
                 result['outputs'] = outputs
                 result['download_urls'] = public_file_downloads(job_id, index)
+
+                file_base = os.path.join(app.config['OUTPUT_FOLDER'], job_id, outputs['stem'])
+                translations = run_translations(job_id, result['segments'], file_base, file_index=index)
+                if translations:
+                    result['translations'] = translations
+                    result['translation_urls'] = translation_download_urls(job_id, translations, file_index=index)
+
+                export_to_downloads(outputs, translations, stem=outputs.get('stem'))
+
                 file_results.append(result)
                 push_event(job_id, 'file_done', {
                     'filename': filename,
@@ -332,6 +579,7 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     'total_files': total_files,
                     'segments': len(result['segments']),
                     'downloads': result['download_urls'],
+                    'translations': result.get('translation_urls'),
                 })
             except Exception as e:
                 failure = {
@@ -446,6 +694,8 @@ def transcribe():
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {'status': 'queued', 'segments': [], 'info': None, 'error': None, 'created_at': time.time()}
+    jobs[job_id]['subtitle'] = parse_subtitle_opts(request.form)
+    jobs[job_id]['translation'] = parse_translation_opts(request.form)
     job_queues[job_id] = Queue()
 
     if folder_session_id:
@@ -647,6 +897,62 @@ def download_batch_file(job_id, file_index, fmt):
 
     stem = outputs.get('stem') or output_stem_for_file(file_result['filename'], file_index)
     return send_file(file_path, as_attachment=True, download_name=f"{stem}.{fmt}")
+
+
+TRANSLATION_KINDS = {
+    'srt': ('srt', 'srt'),
+    'dual': ('dual', 'dual.srt'),
+    'txt': ('txt', 'txt'),
+}
+
+
+def _send_translation(file_path, stem, code, kind, ext):
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({'error': '파일 없음'}), 404
+    return send_file(file_path, as_attachment=True, download_name=f"{stem}.{code}.{ext}")
+
+
+@app.route('/api/download/<job_id>/translation/<code>/<kind>')
+def download_translation(job_id, code, kind):
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    if kind not in TRANSLATION_KINDS:
+        return jsonify({'error': '지원하지 않는 형식'}), 400
+    job = jobs[job_id]
+    if job.get('status') != 'done':
+        return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
+
+    entry = (job.get('translations') or {}).get(code)
+    if not entry:
+        return jsonify({'error': '번역 파일 없음'}), 404
+
+    path_key, ext = TRANSLATION_KINDS[kind]
+    stem = (job.get('outputs') or {}).get('stem', 'transcript')
+    return _send_translation(entry.get(path_key), stem, code, kind, ext)
+
+
+@app.route('/api/download/<job_id>/file/<int:file_index>/translation/<code>/<kind>')
+def download_batch_translation(job_id, file_index, code, kind):
+    if job_id not in jobs:
+        return jsonify({'error': 'Job not found'}), 404
+    if kind not in TRANSLATION_KINDS:
+        return jsonify({'error': '지원하지 않는 형식'}), 400
+    job = jobs[job_id]
+    if job.get('status') != 'done':
+        return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
+
+    files = job.get('files') or []
+    if file_index < 1 or file_index > len(files):
+        return jsonify({'error': '파일 번호를 찾을 수 없습니다.'}), 404
+
+    file_result = files[file_index - 1]
+    entry = (file_result.get('translations') or {}).get(code)
+    if not entry:
+        return jsonify({'error': '번역 파일 없음'}), 404
+
+    path_key, ext = TRANSLATION_KINDS[kind]
+    stem = (file_result.get('outputs') or {}).get('stem') or output_stem_for_file(file_result['filename'], file_index)
+    return _send_translation(entry.get(path_key), stem, code, kind, ext)
 
 
 @app.route('/api/status/<job_id>')

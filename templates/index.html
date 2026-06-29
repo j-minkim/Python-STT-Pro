@@ -106,7 +106,7 @@
             letter-spacing: 0.05em;
         }
 
-        select, input[type="text"] {
+        select, input[type="text"], input[type="number"] {
             width: 100%;
             background: rgba(15, 23, 42, 0.6);
             border: 1px solid rgba(255, 255, 255, 0.1);
@@ -118,7 +118,60 @@
             transition: border-color 0.3s;
         }
 
-        select:focus, input[type="text"]:focus {
+        .field-hint {
+            display: block;
+            margin-top: 6px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: none;
+            letter-spacing: 0;
+            font-weight: 400;
+        }
+
+        .subtitle-len-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+        }
+
+        .lang-checkboxes {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 8px;
+            margin-bottom: 10px;
+        }
+
+        .lang-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 9px 12px;
+            border-radius: 8px;
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            cursor: pointer;
+            font-size: 0.9rem;
+            text-transform: none;
+            letter-spacing: 0;
+            font-weight: 400;
+            margin-bottom: 0;
+        }
+
+        .lang-checkbox input { width: auto; }
+
+        .translation-block {
+            margin-top: 18px;
+            padding-top: 18px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .translation-block .lang-name {
+            color: var(--primary);
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+
+        select:focus, input[type="text"]:focus, input[type="number"]:focus {
             outline: none;
             border-color: var(--primary);
             box-shadow: 0 0 0 2px rgba(0, 242, 254, 0.2);
@@ -523,6 +576,39 @@
                             <input type="text" name="prompt" placeholder="문맥, 이름, 전문용어 등 (예: '입시 컨설팅 대화')">
                         </div>
 
+                        <div class="form-group">
+                            <label>자막(SRT) 한 줄 길이</label>
+                            <div class="subtitle-len-grid">
+                                <div>
+                                    <input type="number" name="subtitle_max_chars" min="10" max="200" value="50">
+                                    <span class="field-hint">최대 글자 수 — 넘으면 분할</span>
+                                </div>
+                                <div>
+                                    <input type="number" name="subtitle_min_chars" min="0" max="200" value="30">
+                                    <span class="field-hint">최소 글자 수 — 이상이면 문장부호에서 끊기</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>자막 번역 (선택)</label>
+                            <div class="lang-checkboxes">
+                                <label class="lang-checkbox"><input type="checkbox" name="translate_langs" value="en"> 영어</label>
+                                <label class="lang-checkbox"><input type="checkbox" name="translate_langs" value="ja"> 일본어</label>
+                                <label class="lang-checkbox"><input type="checkbox" name="translate_langs" value="zh"> 중국어</label>
+                                <label class="lang-checkbox"><input type="checkbox" name="translate_langs" value="la"> 라틴어</label>
+                            </div>
+                            <input type="text" name="translate_langs_custom" placeholder="기타 언어 직접 입력 (쉼표 구분, 예: es, French, Vietnamese)">
+                            <span class="field-hint">선택한 언어로 자막을 번역해 언어별 SRT · 이중 자막 · TXT를 함께 생성합니다.</span>
+                            <div style="margin-top: 12px;">
+                                <label style="font-size: 0.8rem;">번역 엔진</label>
+                                <select name="translate_backend">
+                                    <option value="openai">OpenAI API (정확·라틴어 강함, OPENAI_API_KEY 필요)</option>
+                                    <option value="lmstudio">로컬 LMStudio (무료·오프라인, 1234 포트 실행 필요)</option>
+                                </select>
+                            </div>
+                        </div>
+
                         <button type="submit" class="btn btn-primary" id="submitBtn">
                             <i data-lucide="play"></i> 전사 시작하기
                             <div class="loader" id="btnLoader"></div>
@@ -562,6 +648,7 @@
                             <a href="#" id="dl-srt" class="download-btn"><i data-lucide="subtitles"></i> SRT</a>
                             <a href="#" id="dl-json" class="download-btn"><i data-lucide="code"></i> JSON</a>
                         </div>
+                        <div id="translationDownloads"></div>
                         <div class="file-downloads" id="fileDownloads"></div>
                     </div>
                 </div>
@@ -609,6 +696,7 @@
         const langInfo = document.getElementById('langInfo');
         const downloadButtons = document.querySelector('.download-buttons');
         const fileDownloads = document.getElementById('fileDownloads');
+        const translationDownloads = document.getElementById('translationDownloads');
         const gdriveUrlInput = document.querySelector('input[name="gdrive_url"]');
         const listDriveBtn = document.getElementById('listDriveBtn');
         const gdriveFolderSessionId = document.getElementById('gdriveFolderSessionId');
@@ -661,8 +749,37 @@
             return String(value ?? '').replace(/[&<>"']/g, (char) => map[char]);
         }
 
+        function translationLinksHtml(items) {
+            // items: { code: { name, srt, dual, txt } }
+            return Object.keys(items || {}).map((code) => {
+                const t = items[code];
+                return `
+                    <div style="margin-top:8px;">
+                        <span style="color:var(--primary);font-weight:600;font-size:0.85rem;">${escapeHtml(t.name)}</span>
+                        <div class="file-download-links" style="margin-top:4px;">
+                            <a href="${escapeHtml(t.srt)}">SRT</a>
+                            <a href="${escapeHtml(t.dual)}">이중자막</a>
+                            <a href="${escapeHtml(t.txt)}">TXT</a>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        function renderSingleTranslations(items) {
+            if (!items || !Object.keys(items).length) return;
+            translationDownloads.innerHTML = `
+                <div class="translation-block">
+                    <div class="lang-name"><i data-lucide="languages"></i> 번역 자막</div>
+                    ${translationLinksHtml(items)}
+                </div>`;
+            lucide.createIcons();
+        }
+
         function addFileDownloads(fileData) {
             if (!fileData.downloads) return;
+            const translations = fileData.translations
+                ? `<div style="grid-column:1/-1;">${translationLinksHtml(fileData.translations)}</div>`
+                : '';
             const row = document.createElement('div');
             row.className = 'file-download-row';
             row.innerHTML = `
@@ -672,6 +789,7 @@
                     <a href="${escapeHtml(fileData.downloads.srt)}">SRT</a>
                     <a href="${escapeHtml(fileData.downloads.json)}">JSON</a>
                 </div>
+                ${translations}
             `;
             fileDownloads.appendChild(row);
         }
@@ -795,6 +913,7 @@
             logArea.innerHTML = '';
             transcriptPreview.innerHTML = '';
             fileDownloads.innerHTML = '';
+            translationDownloads.innerHTML = '';
             downloadButtons.style.display = 'flex';
             progressBar.style.width = '0%';
             statusMessage.classList.add('status-pulse');
@@ -878,6 +997,24 @@
                     // Simple progress fake for segments
                     let currentWidth = parseFloat(progressBar.style.width);
                     if (currentWidth < 95) progressBar.style.width = (currentWidth + 1) + '%';
+                }
+
+                if (event.type === 'translate_status') {
+                    statusMessage.textContent = event.data.message;
+                    addLog(event.data.message, 'info');
+                }
+
+                if (event.type === 'translate_error') {
+                    addLog(`번역 오류: ${event.data.message}`, 'error');
+                }
+
+                if (event.type === 'translations') {
+                    renderSingleTranslations(event.data.items);
+                    addLog('번역 자막 생성 완료', 'success');
+                }
+
+                if (event.type === 'saved') {
+                    addLog(`다운로드 폴더에 ${event.data.count}개 파일 저장됨`, 'success');
                 }
 
                 if (event.type === 'file_done') {

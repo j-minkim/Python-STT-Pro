@@ -28,3 +28,11 @@ data/
 models/
 *.bin
 *.pt
+
+# Local secrets / config
+.env
+!.env.example
+
+# Agent / tooling local state & analysis artifacts
+.omc/
+graphify-out/
