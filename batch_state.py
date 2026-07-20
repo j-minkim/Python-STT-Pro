@@ -27,9 +27,19 @@ def source_key_for_url(url):
     return 'url:' + url.strip()
 
 
+def _normalize_options(options):
+    if not options:
+        return {}
+    return {key: options[key] for key in sorted(options)}
+
+
 class BatchState:
-    def __init__(self, source_key, state_dir=None):
+    def __init__(self, source_key, state_dir=None, options=None):
+        """options: processing options (e.g. {'diarize': True}) that must match
+        a completed entry for it to be skipped — rerunning with different
+        options reprocesses the file."""
         self.source_key = source_key
+        self.options = _normalize_options(options)
         directory = state_dir or STATE_DIR
         os.makedirs(directory, exist_ok=True)
         digest = hashlib.sha1(source_key.encode('utf-8')).hexdigest()[:16]
@@ -66,10 +76,15 @@ class BatchState:
             return f'{rel}|unknown'
 
     def is_done(self, key):
-        return self.data['files'].get(key, {}).get('status') == 'done'
+        entry = self.data['files'].get(key)
+        if not entry or entry.get('status') != 'done':
+            return False
+        return _normalize_options(entry.get('options')) == self.options
 
     def mark_done(self, key, outputs=None):
         entry = {'status': 'done', 'completed_at': time.time()}
+        if self.options:
+            entry['options'] = self.options
         if outputs:
             entry['outputs'] = outputs
         self.data['files'][key] = entry

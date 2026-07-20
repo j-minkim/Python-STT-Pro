@@ -84,12 +84,28 @@ https://drive.google.com/file/d/LINK1/view
 ```
 웹 UI에서도 "로컬 폴더 경로" 입력과 Google Drive 폴더 배치에 동일한 이어하기가 적용됩니다.
 
-### 화자 분리 & 요약
+### 화자 분리 (Speaker Diarization)
+pyannote.audio 기반으로 Windows/macOS 모두 동작합니다. **최초 1회 HuggingFace 토큰 설정 필요** (아래 "화자 분리 설정" 참고).
+
+```bash
+# 단일 파일
+./run.sh transcribe audio.mp3 --diarize
+
+# 배치(폴더) 전체에 화자 분리 적용, 화자 수를 알면 지정 가능
+./run.sh batch /path/to/folder --diarize --num-speakers 2
+```
+파일별로 `..._diarized.txt`(화자별 대화록), `..._diarized.json`이 추가 생성됩니다.
+웹 UI에서는 "화자 분리" 체크박스로 켭니다.
+
+배치 이어하기는 **옵션까지 기억**합니다: 화자 분리 없이 완료한 파일은 화자 분리를 켜고
+다시 돌리면 재처리 대상이 되고, 같은 옵션으로 완료된 파일만 건너뜁니다.
+
+### 요약
 LMStudio를 열고 1234 포트로 'Local Server'를 켠 뒤:
 ```bash
 ./run.sh transcribe audio.mp3 --diarize --summary
 ```
-`..._diarized.txt`, `_diarized.json`, `..._summary.md`가 생성됩니다.
+`..._summary.md`가 생성됩니다.
 
 ### GPU 가속 (NVIDIA, Windows/Linux)
 ```bash
@@ -97,6 +113,24 @@ LMStudio를 열고 1234 포트로 'Local Server'를 켠 뒤:
 ```
 
 Windows는 `run.bat`을 더블클릭하거나 `run.bat transcribe "경로"` 형태로 사용하세요.
+
+---
+
+## 화자 분리 설정 (최초 1회, 무료)
+
+1. https://huggingface.co/join 에서 계정 생성 (이미 있으면 로그인)
+2. 아래 **두 모델 페이지 모두**에서 이름·소속을 입력하고 약관 동의 (즉시 자동 승인):
+   - https://huggingface.co/pyannote/speaker-diarization-3.1
+   - https://huggingface.co/pyannote/segmentation-3.0
+3. https://huggingface.co/settings/tokens → "New token" → Type: **Read** → 생성된 `hf_...` 복사
+4. 프로젝트 루트 `.env`에 추가:
+   ```ini
+   HF_TOKEN=hf_여기에붙여넣기
+   ```
+5. 앱 재시작. 첫 실행 시 모델(약 30MB)이 자동 다운로드되며 이후 오프라인 동작.
+
+Windows PC에서도 같은 토큰을 `.env`에 넣으면 됩니다. GPU(CUDA) 또는 Apple Silicon(MPS)이
+있으면 자동 가속되고, `DIARIZE_DEVICE=cpu` 환경변수로 강제 지정할 수 있습니다.
 
 ---
 

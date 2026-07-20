@@ -88,6 +88,26 @@ class BatchStateTest(unittest.TestCase):
             'url:https://drive.google.com/drive/folders/x',
         )
 
+    def test_options_mismatch_reprocesses(self):
+        plain = BatchState('dir:/f', state_dir=self.state_dir)
+        plain.mark_done('a.mp3|10|1')
+
+        diarized = BatchState('dir:/f', state_dir=self.state_dir, options={'diarize': True})
+        self.assertFalse(diarized.is_done('a.mp3|10|1'))
+        diarized.mark_done('a.mp3|10|1')
+
+        self.assertTrue(BatchState('dir:/f', state_dir=self.state_dir, options={'diarize': True}).is_done('a.mp3|10|1'))
+        self.assertFalse(BatchState('dir:/f', state_dir=self.state_dir).is_done('a.mp3|10|1'))
+        self.assertFalse(
+            BatchState('dir:/f', state_dir=self.state_dir, options={'diarize': True, 'num_speakers': 2}).is_done('a.mp3|10|1')
+        )
+
+    def test_options_key_order_does_not_matter(self):
+        first = BatchState('dir:/f', state_dir=self.state_dir, options={'num_speakers': 2, 'diarize': True})
+        first.mark_done('a.mp3|10|1')
+        second = BatchState('dir:/f', state_dir=self.state_dir, options={'diarize': True, 'num_speakers': 2})
+        self.assertTrue(second.is_done('a.mp3|10|1'))
+
     def test_manifest_is_valid_json_on_disk(self):
         state = self.make_state()
         state.mark_done('a.mp3|10|1')

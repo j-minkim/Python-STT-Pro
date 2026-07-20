@@ -12,6 +12,98 @@ except ImportError:
     ClusteringDiarizer = None
     OmegaConf = None
 
+PYANNOTE_MODEL_ID = "pyannote/speaker-diarization-3.1"
+
+HF_TOKEN_HELP = (
+    "화자 분리에는 HuggingFace 토큰이 필요합니다.\n"
+    "1) https://huggingface.co/pyannote/speaker-diarization-3.1 과\n"
+    "   https://huggingface.co/pyannote/segmentation-3.0 두 페이지에서 약관 동의\n"
+    "2) https://huggingface.co/settings/tokens 에서 Read 토큰 발급\n"
+    "3) 프로젝트 루트 .env 파일에 HF_TOKEN=hf_... 추가 후 재시작"
+)
+
+
+class PyannoteDiarizer:
+    """Cross-platform diarizer (Windows/macOS/Linux) backed by pyannote.audio.
+
+    Decodes audio with faster-whisper's PyAV-based loader so mp4/m4a/etc work
+    regardless of the torchaudio backend available on the OS.
+    """
+
+    def __init__(self, hf_token=None):
+        try:
+            import torch
+            from pyannote.audio import Pipeline
+        except ImportError as e:
+            raise ImportError(
+                "pyannote.audio가 설치되어 있지 않습니다. 다음으로 설치하세요:\n"
+                "pip install pyannote.audio 'setuptools<81'"
+            ) from e
+
+        token = hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        if not token:
+            raise RuntimeError(HF_TOKEN_HELP)
+
+        try:
+            try:
+                pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, use_auth_token=token)
+            except TypeError:
+                # Newer huggingface_hub renamed the parameter.
+                pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, token=token)
+        except Exception as e:
+            raise RuntimeError(f"pyannote 모델 로드 실패: {e}\n\n{HF_TOKEN_HELP}") from e
+        if pipeline is None:
+            raise RuntimeError(f"pyannote 모델 접근이 거부되었습니다 (게이트 약관 미동의?).\n\n{HF_TOKEN_HELP}")
+
+        device = os.getenv("DIARIZE_DEVICE")
+        if not device:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        try:
+            pipeline.to(torch.device(device))
+        except Exception:
+            device = "cpu"
+            pipeline.to(torch.device(device))
+
+        self.pipeline = pipeline
+        self.device = device
+
+    def run_diarization(self, audio_path, num_speakers=None):
+        import torch
+        from faster_whisper.audio import decode_audio
+
+        waveform = decode_audio(audio_path, sampling_rate=16000)
+        audio = {
+            "waveform": torch.from_numpy(waveform).unsqueeze(0),
+            "sample_rate": 16000,
+        }
+        kwargs = {}
+        if num_speakers:
+            kwargs["num_speakers"] = int(num_speakers)
+
+        annotation = self.pipeline(audio, **kwargs)
+        segments = [
+            (turn.start, turn.end, label)
+            for turn, _, label in annotation.itertracks(yield_label=True)
+        ]
+        return sorted(segments)
+
+
+def create_diarizer(hf_token=None):
+    """Return the best available diarizer: pyannote first, NeMo as fallback."""
+    try:
+        return PyannoteDiarizer(hf_token=hf_token)
+    except Exception as pyannote_error:
+        if NEMO_AVAILABLE:
+            print(f"[diarizer] pyannote unavailable ({pyannote_error}); falling back to NeMo.")
+            return NeMoDiarizer()
+        raise RuntimeError(f"화자 분리를 사용할 수 없습니다: {pyannote_error}") from pyannote_error
+
+
 class NeMoDiarizer:
     def __init__(self, out_dir="data/diarization_output"):
         if not NEMO_AVAILABLE:

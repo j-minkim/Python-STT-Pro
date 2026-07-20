@@ -9,7 +9,7 @@ from gdrive_utils import download_from_gdrive, is_gdrive_url
 from output_utils import export_all, get_downloads_path
 from media_scan import collect_supported_files
 from batch_state import BatchState, source_key_for_path, source_key_for_list
-from diarizer import NeMoDiarizer, align_words_with_speakers
+from diarizer import create_diarizer, align_words_with_speakers
 from summarizer import LMStudioSummarizer
 
 
@@ -53,6 +53,8 @@ def main():
     batch_parser.add_argument("--lang", default="ko", help="Language code")
     batch_parser.add_argument("--prompt", default=None, help="Base prompt for all files")
     batch_parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and process everything again")
+    batch_parser.add_argument("--diarize", action="store_true", help="Enable speaker diarization for every file")
+    batch_parser.add_argument("--num-speakers", type=int, default=None, help="Fixed number of speakers (optional)")
 
     args = parser.parse_args()
 
@@ -68,14 +70,14 @@ def main():
         
         if getattr(args, 'diarize', False) or getattr(args, 'summary', False):
             try:
-                diarizer = NeMoDiarizer()
+                diarizer = create_diarizer()
                 speaker_segments = diarizer.run_diarization(audio_path)
                 diarized_results = align_words_with_speakers(results, speaker_segments)
                 
                 if getattr(args, 'summary', False):
                     summarizer = LMStudioSummarizer()
                     summary_text = summarizer.summarize_timeline(diarized_results)
-            except ImportError as e:
+            except (ImportError, RuntimeError) as e:
                 console.print(f"[yellow]Warning: {e}[/yellow]")
                 console.print("[yellow]Skipping diarization and summary. Continuing with transcription only.[/yellow]")
                 
@@ -146,11 +148,17 @@ def main():
     elif args.command == "batch":
         input_path = os.path.expanduser(args.input_file.strip().strip('"').strip("'"))
 
+        batch_options = None
+        if args.diarize:
+            batch_options = {"diarize": True}
+            if args.num_speakers:
+                batch_options["num_speakers"] = args.num_speakers
+
         # Build the work list: (label, resume_key, source, is_url).
         # resume_key is None for plain file lines until the file is confirmed to exist.
         items = []
         if os.path.isdir(input_path):
-            state = BatchState(source_key_for_path(input_path))
+            state = BatchState(source_key_for_path(input_path), options=batch_options)
             media_files = collect_supported_files([input_path])
             if not media_files:
                 console.print(f"[red]Error: No supported audio/video files found in '{input_path}'.[/red]")
@@ -158,7 +166,7 @@ def main():
             for path in media_files:
                 items.append((os.path.relpath(path, input_path), BatchState.file_key(path, base_dir=input_path), path, False))
         elif os.path.isfile(input_path):
-            state = BatchState(source_key_for_list(input_path))
+            state = BatchState(source_key_for_list(input_path), options=batch_options)
             with open(input_path, "r", encoding="utf-8") as f:
                 lines = [line.strip() for line in f if line.strip()]
             for line in lines:
@@ -184,6 +192,15 @@ def main():
             f"[green]{done_before}[/green] already done, [bold]{len(items) - done_before}[/bold] to process."
         )
 
+        diarizer = None
+        if args.diarize and done_before < len(items):
+            # Fail fast (missing token/model access) before transcribing anything.
+            try:
+                diarizer = create_diarizer()
+            except (ImportError, RuntimeError) as e:
+                console.print(f"[red]{e}[/red]")
+                return
+
         engine = None  # Loaded lazily so a fully-completed batch skips the model load
         for i, (label, key, source, is_url) in enumerate(items, 1):
             if key is None and check_file_exists(source):
@@ -206,9 +223,15 @@ def main():
                         engine = get_engine(args.model)
                     results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt, word_timestamps=True)
 
+                    diarized_results = None
+                    if diarizer is not None:
+                        console.print("[blue]화자 분리 중...[/blue]")
+                        speaker_segments = diarizer.run_diarization(audio_path, num_speakers=args.num_speakers)
+                        diarized_results = align_words_with_speakers(results, speaker_segments)
+
                     file_name = f"Batch_STT_{i}_{int(time.time())}"
                     out_base = os.path.join(get_downloads_path(), file_name)
-                    export_all(results, out_base)
+                    export_all(results, out_base, diarized_results)
                     if key:
                         state.mark_done(key, {"output_base": out_base})
                     console.print(f"[green]Done. Saved to {out_base}[/green]")

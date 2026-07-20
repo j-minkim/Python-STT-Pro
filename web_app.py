@@ -69,6 +69,58 @@ def parse_subtitle_opts(form):
     return {'max_chars': max_chars, 'min_chars': min_chars}
 
 
+def parse_diarize_opts(form):
+    enabled = (form.get('diarize') or '').strip().lower() not in ('', '0', 'false', 'off')
+    num_raw = (form.get('num_speakers') or '').strip()
+    try:
+        num_speakers = int(num_raw) if num_raw else None
+    except ValueError:
+        num_speakers = None
+    if num_speakers is not None:
+        num_speakers = max(1, min(num_speakers, 20))
+    return {'enabled': enabled, 'num_speakers': num_speakers}
+
+
+def batch_options_for(diarize_opts):
+    """Resume-manifest options: completed entries only count when processed
+    with the same options."""
+    if not diarize_opts or not diarize_opts.get('enabled'):
+        return None
+    options = {'diarize': True}
+    if diarize_opts.get('num_speakers'):
+        options['num_speakers'] = diarize_opts['num_speakers']
+    return options
+
+
+def write_diarized_files(base_path, diarized_results):
+    from output_utils import save_as_diarized_text
+
+    txt_path = base_path + '_diarized.txt'
+    save_as_diarized_text(diarized_results, txt_path)
+    json_path = base_path + '_diarized.json'
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(diarized_results, f, ensure_ascii=False, indent=2)
+    return {'diarized_txt': txt_path, 'diarized_json': json_path}
+
+
+def run_diarization_for_file(job_id, diarizer, audio_path, segments, filename, file_index=None, file_total=None):
+    from diarizer import align_words_with_speakers
+
+    prefix = f'[{file_index}/{file_total}] ' if file_index and file_total else ''
+    push_event(job_id, 'status', {'status': 'diarizing', 'message': f'{prefix}{filename} 화자 분리 중...'})
+    num_speakers = (jobs.get(job_id, {}).get('diarize') or {}).get('num_speakers')
+    speaker_segments = diarizer.run_diarization(audio_path, num_speakers=num_speakers)
+    diarized = align_words_with_speakers(segments, speaker_segments)
+    speakers = sorted({seg['speaker'] for seg in diarized})
+    push_event(job_id, 'diarized', {
+        'filename': filename,
+        'file_index': file_index,
+        'total_files': file_total,
+        'speakers': len(speakers),
+    })
+    return diarized
+
+
 def parse_translation_opts(form):
     """Read translation settings from the request form.
 
@@ -226,10 +278,13 @@ def export_to_downloads(outputs, translations=None, stem=None):
     stem = _safe_stem(stem or (outputs or {}).get("stem"))
     copied = []
 
-    for fmt in ("txt", "srt", "json"):
+    for fmt, ext in (
+        ("txt", "txt"), ("srt", "srt"), ("json", "json"),
+        ("diarized_txt", "diarized.txt"), ("diarized_json", "diarized.json"),
+    ):
         src = (outputs or {}).get(fmt)
         if src and os.path.exists(src):
-            dst = _unique_path(downloads, f"{stem}.{fmt}")
+            dst = _unique_path(downloads, f"{stem}.{ext}")
             shutil.copy2(src, dst)
             copied.append(dst)
 
@@ -301,10 +356,13 @@ def save_file_outputs(job_id, file_result, index):
     return {**paths, 'stem': stem}
 
 
-def public_file_downloads(job_id, index):
+def public_file_downloads(job_id, index, outputs=None):
+    fmts = ['txt', 'srt', 'json']
+    if outputs:
+        fmts += [fmt for fmt in ('diarized_txt', 'diarized_json') if outputs.get(fmt)]
     return {
         fmt: f"/api/download/{job_id}/file/{index}/{fmt}"
-        for fmt in ('txt', 'srt', 'json')
+        for fmt in fmts
     }
 
 
@@ -455,6 +513,17 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         jobs[job_id]['segments'] = result['segments']
         jobs[job_id]['info'] = result['info']
         output_paths = save_outputs(job_id, result['segments'], original_filename)
+
+        if (jobs[job_id].get('diarize') or {}).get('enabled'):
+            from diarizer import create_diarizer
+            push_event(job_id, 'status', {'status': 'loading', 'message': '화자 분리 모델 로딩 중...'})
+            diarizer = create_diarizer()
+            diarized = run_diarization_for_file(
+                job_id, diarizer, audio_path, result['segments'], original_filename or 'transcript',
+            )
+            base = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
+            output_paths.update(write_diarized_files(base, diarized))
+
         jobs[job_id]['outputs'] = output_paths
 
         translations = run_translations(
@@ -510,6 +579,14 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 'message': f'이어하기: 전체 {total_files}개 중 {skipped_total}개는 이미 완료되어 건너뜁니다.',
             })
 
+        diarize_enabled = bool((jobs.get(job_id, {}).get('diarize') or {}).get('enabled'))
+        diarizer = None
+        if diarize_enabled and skipped_total < total_files:
+            # Fail fast with clear instructions before transcribing anything.
+            from diarizer import create_diarizer
+            push_event(job_id, 'status', {'status': 'loading', 'message': '화자 분리 모델 로딩 중...'})
+            diarizer = create_diarizer()
+
         engine = None  # Loaded lazily so a fully-completed batch skips the model load
         file_results = []
         failures = []
@@ -553,8 +630,17 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     file_total=total_files,
                 )
                 outputs = save_file_outputs(job_id, result, index)
+
+                if diarizer is not None:
+                    diarized = run_diarization_for_file(
+                        job_id, diarizer, audio_path, result['segments'], filename,
+                        file_index=index, file_total=total_files,
+                    )
+                    base = os.path.join(app.config['OUTPUT_FOLDER'], job_id, outputs['stem'])
+                    outputs.update(write_diarized_files(base, diarized))
+
                 result['outputs'] = outputs
-                result['download_urls'] = public_file_downloads(job_id, index)
+                result['download_urls'] = public_file_downloads(job_id, index, outputs)
 
                 file_base = os.path.join(app.config['OUTPUT_FOLDER'], job_id, outputs['stem'])
                 translations = run_translations(job_id, result['segments'], file_base, file_index=index)
@@ -696,6 +782,8 @@ def transcribe():
     jobs[job_id] = {'status': 'queued', 'segments': [], 'info': None, 'error': None, 'created_at': time.time()}
     jobs[job_id]['subtitle'] = parse_subtitle_opts(request.form)
     jobs[job_id]['translation'] = parse_translation_opts(request.form)
+    jobs[job_id]['diarize'] = parse_diarize_opts(request.form)
+    resume_options = batch_options_for(jobs[job_id]['diarize'])
     job_queues[job_id] = Queue()
 
     if folder_session_id:
@@ -712,7 +800,7 @@ def transcribe():
             return jsonify({'error': '전사할 파일을 하나 이상 선택해주세요.'}), 400
 
         jobs[job_id]['filename'] = 'gdrive_selected_files'
-        batch_state = BatchState(source_key_for_url(session.get('normalized_url') or session['url']))
+        batch_state = BatchState(source_key_for_url(session.get('normalized_url') or session['url']), options=resume_options)
 
         def selected_gdrive_job():
             try:
@@ -769,7 +857,7 @@ def transcribe():
         if not audio_paths:
             return jsonify({'error': '폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.'}), 400
 
-        batch_state = BatchState(source_key_for_path(local_folder))
+        batch_state = BatchState(source_key_for_path(local_folder), options=resume_options)
         if request.form.get('local_folder_fresh'):
             batch_state.reset()
 
@@ -850,7 +938,7 @@ def transcribe():
 
                     # Re-downloaded files get fresh mtimes, so key folder items
                     # by name+size instead of the default path|size|mtime.
-                    batch_state = BatchState(source_key_for_url(normalize_gdrive_folder_url(gdrive_url)))
+                    batch_state = BatchState(source_key_for_url(normalize_gdrive_folder_url(gdrive_url)), options=resume_options)
                     file_keys = {}
                     for path in audio_paths:
                         try:
@@ -918,13 +1006,13 @@ def download(job_id, fmt):
     job = jobs[job_id]
     if job['status'] != 'done':
         return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
-    if fmt not in ('txt', 'srt', 'json'):
+    if fmt not in DOWNLOAD_FMT_EXTS:
         return jsonify({'error': '지원하지 않는 형식'}), 400
     file_path = job['outputs'].get(fmt)
     if not file_path or not os.path.exists(file_path):
         return jsonify({'error': '파일 없음'}), 404
     stem = job['outputs'].get('stem', 'transcript')
-    return send_file(file_path, as_attachment=True, download_name=f"{stem}.{fmt}")
+    return send_file(file_path, as_attachment=True, download_name=f"{stem}.{DOWNLOAD_FMT_EXTS[fmt]}")
 
 
 @app.route('/api/download/<job_id>/file/<int:file_index>/<fmt>')
@@ -934,7 +1022,7 @@ def download_batch_file(job_id, file_index, fmt):
     job = jobs[job_id]
     if job['status'] != 'done':
         return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
-    if fmt not in ('txt', 'srt', 'json'):
+    if fmt not in DOWNLOAD_FMT_EXTS:
         return jsonify({'error': '지원하지 않는 형식'}), 400
 
     files = job.get('files') or []
@@ -948,8 +1036,16 @@ def download_batch_file(job_id, file_index, fmt):
         return jsonify({'error': '파일 없음'}), 404
 
     stem = outputs.get('stem') or output_stem_for_file(file_result['filename'], file_index)
-    return send_file(file_path, as_attachment=True, download_name=f"{stem}.{fmt}")
+    return send_file(file_path, as_attachment=True, download_name=f"{stem}.{DOWNLOAD_FMT_EXTS[fmt]}")
 
+
+DOWNLOAD_FMT_EXTS = {
+    'txt': 'txt',
+    'srt': 'srt',
+    'json': 'json',
+    'diarized_txt': 'diarized.txt',
+    'diarized_json': 'diarized.json',
+}
 
 TRANSLATION_KINDS = {
     'srt': ('srt', 'srt'),

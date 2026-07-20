@@ -72,6 +72,19 @@
 - 폴더에 지원 미디어가 없으면 명확히 안내.
 - 파일 개별 실패는 기존처럼 기록 후 다음 파일 진행. 전부 실패 시 잡 에러.
 
+## 확장: 화자 분리 (2026-07-20 승인)
+
+- 백엔드: pyannote.audio 3.1 (`diarizer.py`의 `PyannoteDiarizer` + `create_diarizer` 팩토리,
+  NeMo는 설치된 경우에만 폴백). Windows/macOS 모두 동작. `HF_TOKEN` 필요(무료, 1회 설정).
+- 오디오 디코딩은 faster-whisper의 PyAV 로더 재사용 → mp4/m4a 등 컨테이너 포맷 안전.
+- 연결: 웹 단일/배치 잡 + CLI `batch --diarize [--num-speakers N]`. 배치당 diarizer 1회
+  로드, 켜져 있으면 전사 시작 전에 생성해 토큰 문제를 조기에 실패시킴.
+- 산출물: 파일별 `_diarized.txt`/`_diarized.json`, 다운로드 URL(`diarized_txt`/`diarized_json`),
+  다운로드 폴더 내보내기 포함.
+- **이어하기 상호작용**: manifest 항목에 처리 옵션(`{'diarize': true, 'num_speakers': N}`)을
+  기록하고, is_done 판정 시 현재 옵션과 일치해야만 스킵. 옵션이 다르면 재처리.
+- 한계(1단계 제외): 배치 내 파일 간 화자 라벨 매칭 없음(SPEAKER_00은 파일별 독립).
+
 ## 테스트
 
 - `batch_state.py` / `media_scan.py` 단위 테스트 (`tests/`): 상태 저장·로드·스킵 판정,

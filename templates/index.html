@@ -586,6 +586,15 @@
                         </div>
 
                         <div class="form-group">
+                            <label>화자 분리 (선택)</label>
+                            <label class="lang-checkbox"><input type="checkbox" name="diarize" value="1"> 누가 말했는지 화자별로 구분 (pyannote, HF_TOKEN 필요)</label>
+                            <div style="margin-top: 8px;">
+                                <input type="number" name="num_speakers" min="1" max="20" placeholder="화자 수 (알고 있는 경우만 입력, 비우면 자동 감지)">
+                            </div>
+                            <span class="field-hint">파일당 처리 시간이 늘어납니다. 결과는 화자별 대화록(_diarized.txt/.json)으로 추가 저장됩니다.</span>
+                        </div>
+
+                        <div class="form-group">
                             <label>자막(SRT) 한 줄 길이</label>
                             <div class="subtitle-len-grid">
                                 <div>
@@ -656,6 +665,8 @@
                             <a href="#" id="dl-txt" class="download-btn"><i data-lucide="file-text"></i> TXT</a>
                             <a href="#" id="dl-srt" class="download-btn"><i data-lucide="subtitles"></i> SRT</a>
                             <a href="#" id="dl-json" class="download-btn"><i data-lucide="code"></i> JSON</a>
+                            <a href="#" id="dl-diarized-txt" class="download-btn" style="display:none;"><i data-lucide="users"></i> 화자 TXT</a>
+                            <a href="#" id="dl-diarized-json" class="download-btn" style="display:none;"><i data-lucide="users"></i> 화자 JSON</a>
                         </div>
                         <div id="translationDownloads"></div>
                         <div class="file-downloads" id="fileDownloads"></div>
@@ -797,6 +808,8 @@
                     <a href="${escapeHtml(fileData.downloads.txt)}">TXT</a>
                     <a href="${escapeHtml(fileData.downloads.srt)}">SRT</a>
                     <a href="${escapeHtml(fileData.downloads.json)}">JSON</a>
+                    ${fileData.downloads.diarized_txt ? `<a href="${escapeHtml(fileData.downloads.diarized_txt)}">화자TXT</a>` : ''}
+                    ${fileData.downloads.diarized_json ? `<a href="${escapeHtml(fileData.downloads.diarized_json)}">화자JSON</a>` : ''}
                 </div>
                 ${translations}
             `;
@@ -928,6 +941,8 @@
             progressBar.style.width = '0%';
             statusMessage.classList.add('status-pulse');
             currentIsBatch = false;
+            document.getElementById('dl-diarized-txt').style.display = 'none';
+            document.getElementById('dl-diarized-json').style.display = 'none';
             addLog('작업 요청 전송 중...');
 
             try {
@@ -1019,6 +1034,15 @@
                     if (currentWidth < 95) progressBar.style.width = (currentWidth + 1) + '%';
                 }
 
+                if (event.type === 'diarized') {
+                    const label = event.data.filename ? `${event.data.filename}: ` : '';
+                    addLog(`${label}화자 분리 완료 (화자 ${event.data.speakers}명)`, 'success');
+                    if (!currentIsBatch) {
+                        document.getElementById('dl-diarized-txt').style.display = '';
+                        document.getElementById('dl-diarized-json').style.display = '';
+                    }
+                }
+
                 if (event.type === 'translate_status') {
                     statusMessage.textContent = event.data.message;
                     addLog(event.data.message, 'info');
@@ -1074,6 +1098,8 @@
             document.getElementById('dl-txt').href = `/api/download/${jobId}/txt`;
             document.getElementById('dl-srt').href = `/api/download/${jobId}/srt`;
             document.getElementById('dl-json').href = `/api/download/${jobId}/json`;
+            document.getElementById('dl-diarized-txt').href = `/api/download/${jobId}/diarized_txt`;
+            document.getElementById('dl-diarized-json').href = `/api/download/${jobId}/diarized_json`;
         }
     </script>
 </body>
