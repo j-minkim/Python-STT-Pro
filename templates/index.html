@@ -571,6 +571,15 @@
                             </div>
                         </div>
 
+                        <div style="text-align: center; margin: 15px 0; color: var(--text-muted);">OR</div>
+
+                        <div class="form-group">
+                            <label>로컬 폴더 경로 (서버 기준)</label>
+                            <input type="text" name="local_folder_path" placeholder="예: /Volumes/shared/회의녹음 또는 D:\shared\회의녹음">
+                            <span class="field-hint">서버에서 접근 가능한 폴더(마운트된 원격 공유 폴더 포함)를 재귀 스캔해 배치 전사합니다. 이미 완료된 파일은 자동으로 건너뜁니다.</span>
+                            <label class="lang-checkbox" style="margin-top: 8px;"><input type="checkbox" name="local_folder_fresh" value="1"> 완료 기록 무시하고 처음부터 다시 전사</label>
+                        </div>
+
                         <div class="form-group">
                             <label>전사 힌트 (Prompt)</label>
                             <input type="text" name="prompt" placeholder="문맥, 이름, 전문용어 등 (예: '입시 컨설팅 대화')">
@@ -887,12 +896,13 @@
             
             const formData = new FormData(form);
             const gdriveUrl = formData.get('gdrive_url');
+            const localFolder = (formData.get('local_folder_path') || '').trim();
             const selectedIds = selectedFolderFileIds();
-            if (!formData.get('file').name && !formData.get('gdrive_url')) {
-                alert('파일을 선택하거나 Google Drive URL을 입력하세요.');
+            if (!formData.get('file').name && !formData.get('gdrive_url') && !localFolder) {
+                alert('파일을 선택하거나 Google Drive URL 또는 로컬 폴더 경로를 입력하세요.');
                 return;
             }
-            if (!formData.get('file').name && isFolderUrl(gdriveUrl)) {
+            if (!formData.get('file').name && !localFolder && isFolderUrl(gdriveUrl)) {
                 if (!gdriveFolderSessionId.value) {
                     alert('Google Drive 폴더는 먼저 "폴더 파일 불러오기"로 파일 목록을 확인하세요.');
                     return;
@@ -964,8 +974,18 @@
                 if (event.type === 'batch') {
                     currentIsBatch = true;
                     downloadButtons.style.display = 'none';
-                    addLog(`배치 작업 시작: ${event.data.total_files}개 파일`, 'info');
+                    let batchMsg = `배치 작업 시작: ${event.data.total_files}개 파일`;
+                    if (event.data.skipped_files) {
+                        batchMsg += ` (이미 완료 ${event.data.skipped_files}개 건너뜀, ${event.data.pending_files}개 전사 예정)`;
+                    }
+                    addLog(batchMsg, 'info');
                     progressBar.style.width = '10%';
+                }
+
+                if (event.type === 'file_skipped') {
+                    addLog(`[${event.data.file_index}/${event.data.total_files}] 건너뜀 (이미 완료): ${event.data.filename}`, 'info');
+                    const progress = 10 + (event.data.file_index / event.data.total_files) * 80;
+                    progressBar.style.width = `${Math.min(progress, 90)}%`;
                 }
 
                 if (event.type === 'file') {

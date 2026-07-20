@@ -7,6 +7,8 @@ from stt_engine import STTEngine
 from audio_utils import record_audio, check_file_exists
 from gdrive_utils import download_from_gdrive, is_gdrive_url
 from output_utils import export_all, get_downloads_path
+from media_scan import collect_supported_files
+from batch_state import BatchState, source_key_for_path, source_key_for_list
 from diarizer import NeMoDiarizer, align_words_with_speakers
 from summarizer import LMStudioSummarizer
 
@@ -45,11 +47,12 @@ def main():
     gdrive_parser.add_argument("--summary", action="store_true", help="Enable AI summary using LMStudio")
 
     # Batch command
-    batch_parser = subparsers.add_parser("batch", help="Process multiple links/files from a text file")
-    batch_parser.add_argument("input_file", help="Text file containing one URL or path per line")
+    batch_parser = subparsers.add_parser("batch", help="Process a folder of media files, or links/files from a text file")
+    batch_parser.add_argument("input_file", help="Folder to scan recursively, or a text file with one URL/path per line")
     batch_parser.add_argument("--model", default="large-v3-turbo", help="Whisper model size")
     batch_parser.add_argument("--lang", default="ko", help="Language code")
     batch_parser.add_argument("--prompt", default=None, help="Base prompt for all files")
+    batch_parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and process everything again")
 
     args = parser.parse_args()
 
@@ -141,36 +144,82 @@ def main():
             console.print(f"Results saved to: [cyan]{out_base}[/cyan] (Formats: txt, srt, json, etc)")
 
     elif args.command == "batch":
-        if not check_file_exists(args.input_file):
-            console.print(f"[red]Error: Batch file '{args.input_file}' not found.[/red]")
+        input_path = os.path.expanduser(args.input_file.strip().strip('"').strip("'"))
+
+        # Build the work list: (label, resume_key, source, is_url).
+        # resume_key is None for plain file lines until the file is confirmed to exist.
+        items = []
+        if os.path.isdir(input_path):
+            state = BatchState(source_key_for_path(input_path))
+            media_files = collect_supported_files([input_path])
+            if not media_files:
+                console.print(f"[red]Error: No supported audio/video files found in '{input_path}'.[/red]")
+                return
+            for path in media_files:
+                items.append((os.path.relpath(path, input_path), BatchState.file_key(path, base_dir=input_path), path, False))
+        elif os.path.isfile(input_path):
+            state = BatchState(source_key_for_list(input_path))
+            with open(input_path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+            for line in lines:
+                expanded = os.path.expanduser(line.strip('"').strip("'"))
+                if is_gdrive_url(line):
+                    items.append((line, "url:" + line, line, True))
+                elif os.path.isdir(expanded):
+                    for path in collect_supported_files([expanded]):
+                        items.append((path, BatchState.file_key(path, base_dir=expanded), path, False))
+                else:
+                    items.append((expanded, None, expanded, False))
+        else:
+            console.print(f"[red]Error: '{args.input_file}' is not an existing folder or batch list file.[/red]")
             return
 
-        with open(args.input_file, "r", encoding="utf-8") as f:
-            lines = [line.strip() for line in f if line.strip()]
+        if args.fresh:
+            state.reset()
+            console.print("[yellow]--fresh: saved progress cleared, processing everything again.[/yellow]")
 
-        console.print(f"Starting batch process for [bold]{len(lines)}[/bold] items...")
-        engine = get_engine(args.model) # Loaded once for the whole batch
-        
-        for i, line in enumerate(lines, 1):
-            console.print(f"\n[bold yellow]Processing [{i}/{len(lines)}]: {line}[/bold yellow]")
+        done_before = sum(1 for _, key, _, _ in items if key and state.is_done(key))
+        console.print(
+            f"Starting batch process: [bold]{len(items)}[/bold] items total, "
+            f"[green]{done_before}[/green] already done, [bold]{len(items) - done_before}[/bold] to process."
+        )
+
+        engine = None  # Loaded lazily so a fully-completed batch skips the model load
+        for i, (label, key, source, is_url) in enumerate(items, 1):
+            if key is None and check_file_exists(source):
+                key = BatchState.file_key(source)
+
+            if key and state.is_done(key):
+                console.print(f"[cyan][{i}/{len(items)}] 건너뜀 (완료됨): {label}[/cyan]")
+                continue
+
+            console.print(f"\n[bold yellow]Processing [{i}/{len(items)}]: {label}[/bold yellow]")
             try:
-                if is_gdrive_url(line):
+                if is_url:
                     temp_path = os.path.join("data", f"batch_gdrive_{int(time.time())}.mp3")
-                    audio_path = download_from_gdrive(line, temp_path)
+                    audio_path = download_from_gdrive(source, temp_path)
                 else:
-                    audio_path = line
+                    audio_path = source
 
                 if audio_path and check_file_exists(audio_path):
+                    if engine is None:
+                        engine = get_engine(args.model)
                     results, info = engine.transcribe(audio_path, language=args.lang, initial_prompt=args.prompt, word_timestamps=True)
-                    
+
                     file_name = f"Batch_STT_{i}_{int(time.time())}"
                     out_base = os.path.join(get_downloads_path(), file_name)
                     export_all(results, out_base)
+                    if key:
+                        state.mark_done(key, {"output_base": out_base})
                     console.print(f"[green]Done. Saved to {out_base}[/green]")
                 else:
-                    console.print(f"[red]Skipped: Could not find or download {line}[/red]")
+                    if key:
+                        state.mark_failed(key, "file not found or download failed")
+                    console.print(f"[red]Skipped: Could not find or download {label}[/red]")
             except Exception as e:
-                console.print(f"[red]Error processing {line}: {str(e)}[/red]")
+                if key:
+                    state.mark_failed(key, e)
+                console.print(f"[red]Error processing {label}: {str(e)}[/red]")
                 console.print("[yellow]Continuing with next item...[/yellow]")
 
     else:

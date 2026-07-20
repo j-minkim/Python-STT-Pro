@@ -58,15 +58,31 @@ python3 web_app.py
 ```
 
 ### 배치 처리
-한 줄에 링크/경로 하나씩 담은 `list.txt`를 만들고:
+**폴더째 전사** — 폴더 경로를 주면 하위 폴더까지 재귀 스캔해 지원 미디어를 모두 전사합니다
+(마운트된 원격 공유 폴더도 동일):
+```bash
+./run.sh batch /Volumes/shared/회의녹음 --prompt "중고등 입시 컨설팅"
+```
+
+**목록 파일 방식** — 한 줄에 링크/경로 하나씩 담은 `list.txt`를 만들고 (폴더 경로를 적으면
+그 폴더의 파일들로 자동 확장):
 ```text
 https://drive.google.com/file/d/LINK1/view
 /path/to/audio2.mp3
+/path/to/folder
 ```
 실행:
 ```bash
 ./run.sh batch list.txt --prompt "중고등 입시 컨설팅"
 ```
+
+**이어하기(자동)** — 배치 진행상황이 파일 단위로 `data/batch_state/`에 기록되어,
+중간에 끊겨도 같은 명령을 다시 실행하면 완료된 파일은 자동으로 건너뜁니다
+(실패한 파일은 재시도, 원본이 변경된 파일은 다시 전사). 처음부터 다시 돌리려면:
+```bash
+./run.sh batch /path/to/folder --fresh
+```
+웹 UI에서도 "로컬 폴더 경로" 입력과 Google Drive 폴더 배치에 동일한 이어하기가 적용됩니다.
 
 ### 화자 분리 & 요약
 LMStudio를 열고 1234 포트로 'Local Server'를 켠 뒤:

@@ -30,70 +30,14 @@ jobs = {}
 job_queues = {}
 folder_sessions = {}
 
-ALLOWED_EXTENSIONS = {
-    'mp3', 'wav', 'mp4', 'm4a', 'ogg', 'flac', 'webm', 'aac', 'wma',
-    'mov', 'm4v', 'mkv', 'avi',
-}
-
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-def looks_like_supported_media(path):
-    if allowed_file(path):
-        return True
-    if not os.path.isfile(path) or os.path.getsize(path) == 0:
-        return False
-
-    try:
-        with open(path, 'rb') as f:
-            header = f.read(64)
-    except OSError:
-        return False
-
-    if len(header) >= 12 and header[4:8] == b'ftyp':
-        return True
-    if header.startswith((b'ID3', b'OggS', b'fLaC')):
-        return True
-    if len(header) >= 12 and header.startswith(b'RIFF') and header[8:12] == b'WAVE':
-        return True
-    if header.startswith(b'\x1a\x45\xdf\xa3'):
-        return True
-    if len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0:
-        return True
-    return False
-
-
-def list_downloaded_files(paths):
-    files = []
-    for path in paths or []:
-        if not path:
-            continue
-        if os.path.isdir(path):
-            for root, dirs, filenames in os.walk(path):
-                dirs.sort()
-                for filename in sorted(filenames):
-                    files.append(os.path.join(root, filename))
-        elif os.path.isfile(path):
-            files.append(path)
-    return files
-
-
-def collect_supported_files(paths):
-    supported = []
-    for path in list_downloaded_files(paths):
-        if looks_like_supported_media(path):
-            supported.append(path)
-
-    seen = set()
-    unique_paths = []
-    for path in supported:
-        real_path = os.path.realpath(path)
-        if real_path not in seen:
-            seen.add(real_path)
-            unique_paths.append(path)
-    return unique_paths
+from media_scan import (
+    ALLOWED_EXTENSIONS,
+    allowed_file,
+    collect_supported_files,
+    list_downloaded_files,
+    looks_like_supported_media,
+)
+from batch_state import BatchState, source_key_for_path, source_key_for_url
 
 
 def push_event(job_id, event_type, data):
@@ -388,7 +332,7 @@ def safe_download_name(filename, index):
     return f"{index:03d}_{safe_name}"
 
 
-def download_selected_gdrive_files(job_id, session, selected_file_ids):
+def download_selected_gdrive_files(job_id, session, selected_file_ids, state=None):
     selected = set(selected_file_ids)
     selected_records = [
         record for record in session['files']
@@ -404,24 +348,32 @@ def download_selected_gdrive_files(job_id, session, selected_file_ids):
 
     downloaded_paths = []
     display_names = {}
+    file_keys = {}
     failures = []
+    skipped_names = []
 
     for index, record in enumerate(selected_records, 1):
+        resume_key = f"gdrive:{record['id']}"
+        if state and state.is_done(resume_key):
+            skipped_names.append(record['path'])
+            continue
+
         output_path = os.path.join(download_dir, safe_download_name(record['filename'], index))
         downloaded = download_gdrive_file_by_id(record['id'], output_path)
         if downloaded:
             downloaded_paths.append(downloaded)
             display_names[downloaded] = record['path']
+            file_keys[downloaded] = resume_key
         else:
             failures.append(record['path'])
 
-    if not downloaded_paths:
+    if not downloaded_paths and not skipped_names:
         raise ValueError(
             '선택한 Google Drive 파일 다운로드가 모두 실패했습니다.'
             + (f" 실패 파일: {', '.join(failures[:10])}" if failures else '')
         )
 
-    return downloaded_paths, display_names, failures
+    return downloaded_paths, display_names, failures, file_keys, skipped_names
 
 
 def load_engine(job_id, model_size):
@@ -528,28 +480,68 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         push_event(job_id, 'error', {'message': str(e)})
 
 
-def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch', display_names=None):
+def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch', display_names=None, state=None, file_keys=None, pre_skipped=None):
     try:
-        if not audio_paths:
+        pre_skipped = pre_skipped or []
+        if not audio_paths and not pre_skipped:
             raise ValueError('폴더 안에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.')
 
-        push_event(job_id, 'batch', {'total_files': len(audio_paths)})
-        jobs[job_id]['status'] = 'batch'
+        display_names = display_names or {}
+        file_keys = file_keys or {}
 
-        engine = load_engine(job_id, model_size)
+        entries = []
+        for audio_path in audio_paths:
+            resume_key = file_keys.get(audio_path) or (BatchState.file_key(audio_path) if state else None)
+            already_done = bool(state and resume_key and state.is_done(resume_key))
+            entries.append((audio_path, resume_key, already_done))
+
+        total_files = len(pre_skipped) + len(entries)
+        skipped_total = len(pre_skipped) + sum(1 for _, _, done in entries if done)
+
+        push_event(job_id, 'batch', {
+            'total_files': total_files,
+            'skipped_files': skipped_total,
+            'pending_files': total_files - skipped_total,
+        })
+        jobs[job_id]['status'] = 'batch'
+        if skipped_total:
+            push_event(job_id, 'status', {
+                'status': 'batch',
+                'message': f'이어하기: 전체 {total_files}개 중 {skipped_total}개는 이미 완료되어 건너뜁니다.',
+            })
+
+        engine = None  # Loaded lazily so a fully-completed batch skips the model load
         file_results = []
         failures = []
-        total_files = len(audio_paths)
-        display_names = display_names or {}
+        index = 0
 
-        for index, audio_path in enumerate(audio_paths, 1):
+        for skipped_name in pre_skipped:
+            index += 1
+            push_event(job_id, 'file_skipped', {
+                'filename': skipped_name,
+                'file_index': index,
+                'total_files': total_files,
+            })
+
+        for audio_path, resume_key, already_done in entries:
+            index += 1
             filename = display_names.get(audio_path, os.path.basename(audio_path))
+            if already_done:
+                push_event(job_id, 'file_skipped', {
+                    'filename': filename,
+                    'file_index': index,
+                    'total_files': total_files,
+                })
+                continue
+
             push_event(job_id, 'file', {
                 'filename': filename,
                 'file_index': index,
                 'total_files': total_files,
             })
             try:
+                if engine is None:
+                    engine = load_engine(job_id, model_size)
                 result = transcribe_with_engine(
                     job_id,
                     engine,
@@ -573,6 +565,8 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 export_to_downloads(outputs, translations, stem=outputs.get('stem'))
 
                 file_results.append(result)
+                if state and resume_key:
+                    state.mark_done(resume_key, outputs)
                 push_event(job_id, 'file_done', {
                     'filename': filename,
                     'file_index': index,
@@ -582,6 +576,8 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     'translations': result.get('translation_urls'),
                 })
             except Exception as e:
+                if state and resume_key:
+                    state.mark_failed(resume_key, e)
                 failure = {
                     'filename': filename,
                     'file_index': index,
@@ -591,7 +587,7 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 failures.append(failure)
                 push_event(job_id, 'file_error', failure)
 
-        if not file_results:
+        if not file_results and not skipped_total:
             raise ValueError('폴더 내 파일 전사가 모두 실패했습니다.')
 
         all_segments = [seg for file_result in file_results for seg in file_result['segments']]
@@ -613,12 +609,15 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
         jobs[job_id]['status'] = 'done'
 
         message = f"배치 전사 완료: 성공 {len(file_results)}개"
+        if skipped_total:
+            message += f", 건너뜀(이미 완료) {skipped_total}개"
         if failures:
             message += f", 실패 {len(failures)}개"
         push_event(job_id, 'done', {
             'message': message,
             'total_files': total_files,
             'successful_files': len(file_results),
+            'skipped_files': skipped_total,
             'failed_files': len(failures),
             'total_segments': len(all_segments),
         })
@@ -691,6 +690,7 @@ def transcribe():
     prompt = request.form.get('prompt', '') or None
     folder_session_id = request.form.get('gdrive_folder_session_id', '').strip()
     selected_file_ids_raw = request.form.get('selected_file_ids', '').strip()
+    local_folder_raw = request.form.get('local_folder_path', '').strip().strip('"').strip("'")
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {'status': 'queued', 'segments': [], 'info': None, 'error': None, 'created_at': time.time()}
@@ -712,14 +712,17 @@ def transcribe():
             return jsonify({'error': '전사할 파일을 하나 이상 선택해주세요.'}), 400
 
         jobs[job_id]['filename'] = 'gdrive_selected_files'
+        batch_state = BatchState(source_key_for_url(session.get('normalized_url') or session['url']))
 
         def selected_gdrive_job():
             try:
                 push_event(job_id, 'status', {'status': 'downloading', 'message': '선택한 Google Drive 파일 다운로드 중...'})
                 jobs[job_id]['status'] = 'downloading'
-                downloaded_paths, display_names, failures = download_selected_gdrive_files(job_id, session, selected_file_ids)
+                downloaded_paths, display_names, failures, file_keys, skipped_names = download_selected_gdrive_files(
+                    job_id, session, selected_file_ids, state=batch_state,
+                )
                 audio_paths = collect_supported_files(downloaded_paths)
-                if not audio_paths:
+                if not audio_paths and not skipped_names:
                     downloaded_names = ', '.join(os.path.basename(path) or path for path in downloaded_paths[:10])
                     raise ValueError(
                         '선택한 파일을 다운로드했지만 지원하는 오디오/비디오 파일을 찾지 못했습니다.'
@@ -734,7 +737,8 @@ def transcribe():
                 else:
                     push_event(job_id, 'status', {
                         'status': 'queued',
-                        'message': f'선택 파일 {len(audio_paths)}개를 전사합니다.',
+                        'message': f'선택 파일 {len(audio_paths)}개를 전사합니다.'
+                        + (f' (이미 완료된 {len(skipped_names)}개는 다운로드 없이 건너뜁니다.)' if skipped_names else ''),
                     })
 
                 run_batch_transcription_job(
@@ -745,6 +749,9 @@ def transcribe():
                     prompt,
                     batch_name='gdrive_selected_files',
                     display_names=display_names,
+                    state=batch_state,
+                    file_keys=file_keys,
+                    pre_skipped=skipped_names,
                 )
             except Exception as e:
                 jobs[job_id]['status'] = 'error'
@@ -752,6 +759,36 @@ def transcribe():
                 push_event(job_id, 'error', {'message': str(e)})
 
         threading.Thread(target=selected_gdrive_job, daemon=True).start()
+
+    elif local_folder_raw:
+        local_folder = os.path.expanduser(local_folder_raw)
+        if not os.path.isdir(local_folder):
+            return jsonify({'error': f'폴더를 찾을 수 없습니다: {local_folder_raw} (서버에서 접근 가능한 경로여야 합니다.)'}), 400
+
+        audio_paths = collect_supported_files([local_folder])
+        if not audio_paths:
+            return jsonify({'error': '폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.'}), 400
+
+        batch_state = BatchState(source_key_for_path(local_folder))
+        if request.form.get('local_folder_fresh'):
+            batch_state.reset()
+
+        file_keys = {path: BatchState.file_key(path, base_dir=local_folder) for path in audio_paths}
+        display_names = {path: os.path.relpath(path, local_folder) for path in audio_paths}
+        jobs[job_id]['filename'] = os.path.basename(os.path.normpath(local_folder)) or local_folder
+
+        thread = threading.Thread(
+            target=run_batch_transcription_job,
+            args=(job_id, audio_paths, model_size, language, prompt),
+            kwargs={
+                'batch_name': 'local_folder_batch',
+                'display_names': display_names,
+                'state': batch_state,
+                'file_keys': file_keys,
+            },
+            daemon=True,
+        )
+        thread.start()
 
     elif 'file' in request.files and request.files['file'].filename:
         file = request.files['file']
@@ -784,6 +821,7 @@ def transcribe():
                     download_from_gdrive,
                     is_gdrive_folder_url,
                     is_gdrive_url,
+                    normalize_gdrive_folder_url,
                 )
                 if not is_gdrive_url(gdrive_url):
                     raise ValueError('유효한 Google Drive URL이 아닙니다.')
@@ -809,6 +847,18 @@ def transcribe():
                         'status': 'queued',
                         'message': f'폴더에서 전사 대상 {len(audio_paths)}개를 찾았습니다. 다운로드 파일 {len(downloaded_files)}개.',
                     })
+
+                    # Re-downloaded files get fresh mtimes, so key folder items
+                    # by name+size instead of the default path|size|mtime.
+                    batch_state = BatchState(source_key_for_url(normalize_gdrive_folder_url(gdrive_url)))
+                    file_keys = {}
+                    for path in audio_paths:
+                        try:
+                            size = os.path.getsize(path)
+                        except OSError:
+                            size = 'unknown'
+                        file_keys[path] = f'gdrive-name:{os.path.normcase(os.path.basename(path))}|{size}'
+
                     run_batch_transcription_job(
                         job_id,
                         audio_paths,
@@ -816,6 +866,8 @@ def transcribe():
                         language,
                         prompt,
                         batch_name='gdrive_folder_batch',
+                        state=batch_state,
+                        file_keys=file_keys,
                     )
                     return
 
