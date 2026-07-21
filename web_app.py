@@ -6,6 +6,7 @@ import time
 import uuid
 import shutil
 import threading
+import unicodedata
 from queue import Queue, Empty
 from flask import Flask, request, jsonify, send_file, Response, render_template
 from werkzeug.utils import secure_filename
@@ -244,8 +245,11 @@ def translation_download_urls(job_id, translations, file_index=None):
 
 
 def _safe_stem(stem):
-    stem = (stem or "transcript").strip()
-    stem = re.sub(r"[\\/:*?\"<>|]+", "_", stem)  # filename-unsafe chars
+    # Unicode-safe: keeps Korean etc., strips only chars Windows/macOS forbid
+    # in filenames. NFC so names match across both platforms.
+    stem = unicodedata.normalize("NFC", (stem or "transcript").strip())
+    stem = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", stem)
+    stem = stem.strip(" .")
     return stem or "transcript"
 
 
@@ -333,8 +337,13 @@ def save_outputs(job_id, segments, original_filename='transcript'):
 
 
 def output_stem_for_file(filename, index):
-    stem = secure_filename(os.path.splitext(os.path.basename(filename))[0])
-    return f"{index:03d}_{stem or 'transcript'}"
+    # Result files carry the source media's name (Korean intact); the
+    # display name may include a subfolder (relpath), which _safe_stem
+    # flattens to underscores, keeping in-batch stems unique.
+    stem = _safe_stem(os.path.splitext(filename or '')[0])
+    if stem == 'transcript':
+        stem = f'transcript_{index:03d}'
+    return stem
 
 
 def save_file_outputs(job_id, file_result, index):
