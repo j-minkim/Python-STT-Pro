@@ -50,6 +50,21 @@ def list_downloaded_files(paths):
     return files
 
 
+def media_duration_seconds(path):
+    """Media length from container metadata (fast, no decoding). None if unknown."""
+    try:
+        import av
+        with av.open(path) as container:
+            if container.duration:
+                return container.duration / av.time_base
+            for stream in container.streams:
+                if stream.duration and stream.time_base:
+                    return float(stream.duration * stream.time_base)
+    except Exception:
+        return None
+    return None
+
+
 def collect_supported_files(paths):
     supported = []
     for path in list_downloaded_files(paths):

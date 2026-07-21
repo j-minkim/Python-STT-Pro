@@ -18,21 +18,11 @@ import glob
 import json
 import os
 import sys
-import unicodedata
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
-MIN_TOKENS = 15
-MAX_UNIQUE = 3
-
-
-def nfc(text):
-    return unicodedata.normalize('NFC', text)
-
-
-def is_hallucinated(text):
-    tokens = (text or '').split()
-    return len(tokens) >= MIN_TOKENS and len(set(tokens)) <= MAX_UNIQUE
+from qa_checks import hallucination_spans, nfc  # noqa: E402
 
 
 def scan():
@@ -61,11 +51,7 @@ def scan():
     for name, (_, path) in latest.items():
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
-        hits = [
-            (seg.get('start'), seg.get('end'), (seg.get('text') or '')[:40])
-            for seg in data.get('segments') or []
-            if is_hallucinated(seg.get('text'))
-        ]
+        hits = hallucination_spans(data.get('segments'))
         if hits:
             flagged[name] = hits
     return flagged

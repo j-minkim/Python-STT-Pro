@@ -18,6 +18,10 @@ echo [INFO] Installing/Updating dependencies...
 pip install -r requirements.txt --quiet
 
 echo [INFO] Starting Python STT Pro...
-python main.py %*
+if "%1"=="web" (
+    python web_app.py
+) else (
+    python main.py %*
+)
 
 pause

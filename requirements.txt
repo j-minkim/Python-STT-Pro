@@ -7,6 +7,7 @@ python-dotenv
 gdown
 openai
 flask
+waitress
 # Speaker diarization (cross-platform). Needs HF_TOKEN in .env — see README.
 pyannote.audio
 # pyannote deps still import pkg_resources, removed in setuptools>=81

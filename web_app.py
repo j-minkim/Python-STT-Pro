@@ -7,7 +7,8 @@ import uuid
 import shutil
 import threading
 import unicodedata
-from queue import Queue, Empty
+import functools
+from queue import Queue
 from flask import Flask, request, jsonify, send_file, Response, render_template
 from werkzeug.utils import secure_filename
 
@@ -28,8 +29,102 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 jobs = {}
-job_queues = {}
 folder_sessions = {}
+
+# One worker thread runs jobs sequentially so two batches can never load two
+# Whisper models at once; extra submissions wait in line.
+job_queue = Queue()
+_worker_state = {'current': None}
+
+# Keep at most this many segment events per job in the replayable history
+# (other event types are never dropped).
+EVENT_SEGMENT_CAP = 300
+
+# Event types worth flushing the persistent job record for.
+PERSIST_EVENT_TYPES = {
+    'status', 'batch', 'file', 'file_done', 'file_error', 'file_skipped',
+    'done', 'error', 'qa', 'diarized',
+}
+
+
+def persist_job(job_id):
+    job = jobs.get(job_id)
+    if job is not None:
+        try:
+            job_store.save_job(job_id, job)
+        except OSError:
+            pass
+
+
+def _job_worker():
+    while True:
+        job_id, fn = job_queue.get()
+        _worker_state['current'] = job_id
+        try:
+            fn()
+        except Exception as e:
+            job = jobs.get(job_id)
+            if job is not None:
+                job['status'] = 'error'
+                job['error'] = str(e)
+                push_event(job_id, 'error', {'message': str(e)})
+        finally:
+            _worker_state['current'] = None
+            job_queue.task_done()
+
+
+def enqueue_job(job_id, fn):
+    waiting = job_queue.qsize() + (1 if _worker_state['current'] else 0)
+    if waiting:
+        push_event(job_id, 'status', {
+            'status': 'queued',
+            'message': f'대기열에 추가됨 — 앞에 {waiting}개 작업이 있습니다.',
+        })
+    persist_job(job_id)
+    job_queue.put((job_id, fn))
+
+
+threading.Thread(target=_job_worker, daemon=True).start()
+
+
+def cleanup_stale_data():
+    """Drop old uploads/outputs and dead folder sessions."""
+    now = time.time()
+    upload_ttl = float(os.getenv('UPLOAD_RETENTION_DAYS', '7')) * 86400
+    output_ttl = float(os.getenv('OUTPUT_RETENTION_DAYS', '30')) * 86400
+
+    for entry in os.scandir(app.config['UPLOAD_FOLDER']):
+        try:
+            if now - entry.stat().st_mtime > upload_ttl:
+                if entry.is_dir():
+                    shutil.rmtree(entry.path, ignore_errors=True)
+                else:
+                    os.remove(entry.path)
+        except OSError:
+            continue
+
+    for entry in os.scandir(app.config['OUTPUT_FOLDER']):
+        try:
+            if entry.is_dir() and now - entry.stat().st_mtime > output_ttl:
+                shutil.rmtree(entry.path, ignore_errors=True)
+                job_store.mark_expired(entry.name)
+        except OSError:
+            continue
+
+    for session_id in [
+        sid for sid, session in folder_sessions.items()
+        if now - session.get('created_at', 0) > 86400
+    ]:
+        folder_sessions.pop(session_id, None)
+
+
+def _cleanup_loop():
+    while True:
+        try:
+            cleanup_stale_data()
+        except Exception:
+            pass
+        time.sleep(6 * 3600)
 
 from media_scan import (
     ALLOWED_EXTENSIONS,
@@ -37,13 +132,33 @@ from media_scan import (
     collect_supported_files,
     list_downloaded_files,
     looks_like_supported_media,
+    media_duration_seconds,
 )
 from batch_state import BatchState, source_key_for_path, source_key_for_url
+import job_store
+from qa_checks import qa_report
+
+job_store.mark_interrupted_jobs()
+threading.Thread(target=_cleanup_loop, daemon=True).start()
 
 
 def push_event(job_id, event_type, data):
-    if job_id in job_queues:
-        job_queues[job_id].put({'type': event_type, 'data': data})
+    """Append to the job's replayable event history (SSE reads by cursor)."""
+    job = jobs.get(job_id)
+    if job is None:
+        return
+    events = job.setdefault('events', [])
+    events.append({'type': event_type, 'data': data})
+    if event_type == 'segment':
+        job['_segment_events'] = job.get('_segment_events', 0) + 1
+        if job['_segment_events'] > EVENT_SEGMENT_CAP:
+            for i, event in enumerate(events):
+                if event['type'] == 'segment':
+                    del events[i]
+                    job['_segment_events'] -= 1
+                    break
+    if event_type in PERSIST_EVENT_TYPES:
+        persist_job(job_id)
 
 
 def format_srt_time(seconds):
@@ -453,7 +568,7 @@ def load_engine(job_id, model_size):
     return engine
 
 
-def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filename=None, file_index=None, file_total=None):
+def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filename=None, file_index=None, file_total=None, progress_ctx=None):
     display_name = filename or os.path.basename(audio_path)
     if file_index and file_total:
         message = f'[{file_index}/{file_total}] {display_name} 전사 진행 중...'
@@ -487,6 +602,12 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
         lang_info['file_index'] = file_index
         lang_info['total_files'] = file_total
     push_event(job_id, 'info', lang_info)
+
+    # Real progress: audio-time processed over total audio time. A batch
+    # passes a shared ctx; single files measure against their own duration.
+    if progress_ctx is None:
+        progress_ctx = {'total': info.duration or 0, 'done': 0.0}
+    file_duration = info.duration or 0
 
     # Auto-detection can silently pick the wrong language when the clip opens
     # with silence/music, which makes Whisper output read like a translation.
@@ -522,6 +643,17 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
         results.append(seg_data)
         # Keep the live stream light: drop word-level detail from the UI event.
         push_event(job_id, 'segment', {k: v for k, v in seg_data.items() if k != 'words'})
+
+        if progress_ctx.get('total'):
+            position = progress_ctx['done'] + min(seg_data['end'], file_duration)
+            percent = int(min(99, position / progress_ctx['total'] * 100))
+            if percent != progress_ctx.get('last_percent'):
+                progress_ctx['last_percent'] = percent
+                push_event(job_id, 'progress', {
+                    'percent': percent,
+                    'file_index': file_index,
+                    'total_files': file_total,
+                })
 
     return {
         'filename': display_name,
@@ -565,6 +697,16 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         if saved:
             push_event(job_id, 'saved', {'count': len(saved), 'directory': os.path.dirname(saved[0])})
 
+        report = qa_report([result], requested_language=language)
+        jobs[job_id]['qa'] = report
+        if report['flagged']:
+            push_event(job_id, 'qa', {
+                'count': len(report['flagged']),
+                'details': report['flagged'],
+                'requeueable': False,
+                'job_id': job_id,
+            })
+
         jobs[job_id]['status'] = 'done'
         push_event(job_id, 'done', {'message': '전사 완료!', 'total_segments': len(result['segments'])})
 
@@ -603,6 +745,22 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 'status': 'batch',
                 'message': f'이어하기: 전체 {total_files}개 중 {skipped_total}개는 이미 완료되어 건너뜁니다.',
             })
+
+        # Time-based progress needs every pending file's duration up front;
+        # if any is unreadable fall back to no progress events (total=0).
+        pending_durations = {}
+        total_duration = 0.0
+        durations_known = True
+        for audio_path, _, already_done in entries:
+            if already_done:
+                continue
+            duration = media_duration_seconds(audio_path)
+            if not duration:
+                durations_known = False
+                break
+            pending_durations[audio_path] = duration
+            total_duration += duration
+        progress_ctx = {'total': total_duration if durations_known else 0, 'done': 0.0}
 
         diarize_enabled = bool((jobs.get(job_id, {}).get('diarize') or {}).get('enabled'))
         diarizer = None
@@ -653,6 +811,7 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     filename,
                     file_index=index,
                     file_total=total_files,
+                    progress_ctx=progress_ctx,
                 )
                 outputs = save_file_outputs(job_id, result, index)
 
@@ -697,6 +856,8 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 }
                 failures.append(failure)
                 push_event(job_id, 'file_error', failure)
+            finally:
+                progress_ctx['done'] += pending_durations.get(audio_path, 0)
 
         if not file_results and not skipped_total:
             raise ValueError('폴더 내 파일 전사가 모두 실패했습니다.')
@@ -717,6 +878,23 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 for file_result in file_results
             ],
         }
+        jobs[job_id]['batch_summary'] = {
+            'total_files': total_files,
+            'successful': len(file_results),
+            'skipped': skipped_total,
+            'failed': len(failures),
+        }
+
+        report = qa_report(file_results, requested_language=language)
+        jobs[job_id]['qa'] = report
+        if report['flagged']:
+            push_event(job_id, 'qa', {
+                'count': len(report['flagged']),
+                'details': report['flagged'],
+                'requeueable': (jobs[job_id].get('source') or {}).get('type') == 'local_folder',
+                'job_id': job_id,
+            })
+
         jobs[job_id]['status'] = 'done'
 
         message = f"배치 전사 완료: 성공 {len(file_results)}개"
@@ -794,6 +972,43 @@ def list_gdrive_folder():
     })
 
 
+def prepare_local_folder_job(job_id, local_folder, fresh=False):
+    """Validate and enqueue a local-folder batch. Returns an error message or
+    None. Shared by /api/transcribe and /api/requeue."""
+    local_folder = os.path.expanduser((local_folder or '').strip().strip('"').strip("'"))
+    if not os.path.isdir(local_folder):
+        return f'폴더를 찾을 수 없습니다: {local_folder} (서버에서 접근 가능한 경로여야 합니다.)'
+
+    audio_paths = collect_supported_files([local_folder])
+    if not audio_paths:
+        return '폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.'
+
+    job = jobs[job_id]
+    params = job.get('params') or {}
+    batch_state = BatchState(
+        source_key_for_path(local_folder),
+        options=batch_options_for(job.get('diarize')),
+    )
+    if fresh:
+        batch_state.reset()
+
+    file_keys = {path: BatchState.file_key(path, base_dir=local_folder) for path in audio_paths}
+    display_names = {path: os.path.relpath(path, local_folder) for path in audio_paths}
+    job['filename'] = os.path.basename(os.path.normpath(local_folder)) or local_folder
+    job['source'] = {'type': 'local_folder', 'path': local_folder}
+
+    enqueue_job(job_id, functools.partial(
+        run_batch_transcription_job,
+        job_id, audio_paths, params.get('model', 'large-v3-turbo'),
+        params.get('language'), params.get('prompt'),
+        batch_name='local_folder_batch',
+        display_names=display_names,
+        state=batch_state,
+        file_keys=file_keys,
+    ))
+    return None
+
+
 @app.route('/api/transcribe', methods=['POST'])
 def transcribe():
     model_size = request.form.get('model', 'large-v3-turbo')
@@ -804,12 +1019,16 @@ def transcribe():
     local_folder_raw = request.form.get('local_folder_path', '').strip().strip('"').strip("'")
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {'status': 'queued', 'segments': [], 'info': None, 'error': None, 'created_at': time.time()}
+    jobs[job_id] = {
+        'status': 'queued', 'segments': [], 'info': None, 'error': None,
+        'created_at': time.time(), 'events': [],
+        'params': {'model': model_size, 'language': language, 'prompt': prompt},
+    }
     jobs[job_id]['subtitle'] = parse_subtitle_opts(request.form)
     jobs[job_id]['translation'] = parse_translation_opts(request.form)
     jobs[job_id]['diarize'] = parse_diarize_opts(request.form)
+    jobs[job_id]['params']['diarize'] = jobs[job_id]['diarize']
     resume_options = batch_options_for(jobs[job_id]['diarize'])
-    job_queues[job_id] = Queue()
 
     if folder_session_id:
         session = folder_sessions.get(folder_session_id)
@@ -871,37 +1090,18 @@ def transcribe():
                 jobs[job_id]['error'] = str(e)
                 push_event(job_id, 'error', {'message': str(e)})
 
-        threading.Thread(target=selected_gdrive_job, daemon=True).start()
+        jobs[job_id]['source'] = {'type': 'gdrive_selected', 'url': session.get('normalized_url') or session['url']}
+        enqueue_job(job_id, selected_gdrive_job)
 
     elif local_folder_raw:
-        local_folder = os.path.expanduser(local_folder_raw)
-        if not os.path.isdir(local_folder):
-            return jsonify({'error': f'폴더를 찾을 수 없습니다: {local_folder_raw} (서버에서 접근 가능한 경로여야 합니다.)'}), 400
-
-        audio_paths = collect_supported_files([local_folder])
-        if not audio_paths:
-            return jsonify({'error': '폴더에서 지원하는 오디오/비디오 파일을 찾지 못했습니다.'}), 400
-
-        batch_state = BatchState(source_key_for_path(local_folder), options=resume_options)
-        if request.form.get('local_folder_fresh'):
-            batch_state.reset()
-
-        file_keys = {path: BatchState.file_key(path, base_dir=local_folder) for path in audio_paths}
-        display_names = {path: os.path.relpath(path, local_folder) for path in audio_paths}
-        jobs[job_id]['filename'] = os.path.basename(os.path.normpath(local_folder)) or local_folder
-
-        thread = threading.Thread(
-            target=run_batch_transcription_job,
-            args=(job_id, audio_paths, model_size, language, prompt),
-            kwargs={
-                'batch_name': 'local_folder_batch',
-                'display_names': display_names,
-                'state': batch_state,
-                'file_keys': file_keys,
-            },
-            daemon=True,
+        error = prepare_local_folder_job(
+            job_id,
+            os.path.expanduser(local_folder_raw),
+            fresh=bool(request.form.get('local_folder_fresh')),
         )
-        thread.start()
+        if error:
+            jobs.pop(job_id, None)
+            return jsonify({'error': error}), 400
 
     elif 'file' in request.files and request.files['file'].filename:
         file = request.files['file']
@@ -913,17 +1113,16 @@ def transcribe():
         audio_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(audio_path)
         jobs[job_id]['filename'] = original_filename
+        jobs[job_id]['source'] = {'type': 'upload'}
 
-        thread = threading.Thread(
-            target=run_transcription_job,
-            args=(job_id, audio_path, model_size, language, prompt, original_filename),
-            daemon=True
-        )
-        thread.start()
+        enqueue_job(job_id, functools.partial(
+            run_transcription_job, job_id, audio_path, model_size, language, prompt, original_filename,
+        ))
 
     elif request.form.get('gdrive_url'):
         gdrive_url = request.form.get('gdrive_url')
         jobs[job_id]['filename'] = 'gdrive_file'
+        jobs[job_id]['source'] = {'type': 'gdrive_url', 'url': gdrive_url}
 
         def gdrive_job():
             try:
@@ -994,28 +1193,64 @@ def transcribe():
                 jobs[job_id]['error'] = str(e)
                 push_event(job_id, 'error', {'message': str(e)})
 
-        threading.Thread(target=gdrive_job, daemon=True).start()
+        enqueue_job(job_id, gdrive_job)
     else:
+        jobs.pop(job_id, None)
         return jsonify({'error': '파일 또는 Google Drive URL을 제공해주세요.'}), 400
 
+    persist_job(job_id)
     return jsonify({'job_id': job_id})
+
+
+def _sse(event):
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 @app.route('/api/stream/<job_id>')
 def stream(job_id):
-    if job_id not in job_queues:
-        return jsonify({'error': 'Job not found'}), 404
+    if job_id not in jobs:
+        # Job from a previous server run: replay a summary from the registry.
+        record = job_store.load_job(job_id)
+        if not record:
+            return jsonify({'error': 'Job not found'}), 404
+
+        def replay_stored():
+            status = record.get('status')
+            if status == 'done':
+                yield _sse({'type': 'done', 'data': {
+                    'message': '이전 세션에서 완료된 작업입니다. 작업 기록에서 결과를 내려받을 수 있습니다.',
+                }})
+            else:
+                yield _sse({'type': 'error', 'data': {
+                    'message': '서버 재시작으로 중단된 작업입니다. 같은 소스를 다시 제출하면 완료된 파일은 건너뛰고 이어서 처리됩니다.',
+                }})
+
+        return Response(replay_stored(), mimetype='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
     def generate():
-        q = job_queues[job_id]
+        # Cursor over the job's event history: replays past events on
+        # (re)connect, then follows live ones. Multiple viewers are fine.
+        cursor = 0
+        idle = 0.0
         while True:
-            try:
-                event = q.get(timeout=30)
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            events = jobs[job_id].get('events') or []
+            progressed = False
+            while cursor < len(events):
+                event = events[cursor]
+                cursor += 1
+                progressed = True
+                yield _sse(event)
                 if event['type'] in ('done', 'error'):
-                    break
-            except Empty:
-                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+                    return
+            if progressed:
+                idle = 0.0
+            else:
+                time.sleep(0.4)
+                idle += 0.4
+                if idle >= 15:
+                    idle = 0.0
+                    yield _sse({'type': 'ping'})
 
     return Response(
         generate(),
@@ -1024,11 +1259,94 @@ def stream(job_id):
     )
 
 
+def _job_summary(job_id, job):
+    """Uniform summary shape for both in-memory and persisted jobs."""
+    qa = job.get('qa') or {}
+    source = job.get('source') or {}
+    return {
+        'job_id': job_id,
+        'status': job.get('status'),
+        'filename': job.get('filename'),
+        'created_at': job.get('created_at'),
+        'error': job.get('error'),
+        'batch_summary': job.get('batch_summary'),
+        'qa_flagged': len(qa.get('flagged') or []),
+        'requeueable': source.get('type') == 'local_folder',
+        'expired': bool(job.get('expired')),
+        'files': [
+            {
+                'filename': f.get('filename'),
+                'download_urls': f.get('download_urls'),
+            }
+            for f in (job.get('files') or [])
+        ],
+    }
+
+
+@app.route('/api/jobs')
+def jobs_list():
+    merged = {record['job_id']: record for record in job_store.list_jobs(limit=50)}
+    merged.update({job_id: job for job_id, job in jobs.items()})  # memory is fresher
+    summaries = [_job_summary(job_id, job) for job_id, job in merged.items()]
+    summaries.sort(key=lambda s: s.get('created_at') or 0, reverse=True)
+    active = _worker_state['current']
+    return jsonify({
+        'jobs': summaries[:30],
+        'active_job_id': active,
+        'queued_count': job_queue.qsize(),
+    })
+
+
+@app.route('/api/requeue/<job_id>', methods=['POST'])
+def requeue(job_id):
+    record = jobs.get(job_id) or job_store.load_job(job_id)
+    if not record:
+        return jsonify({'error': '작업을 찾을 수 없습니다.'}), 404
+
+    source = record.get('source') or {}
+    if source.get('type') != 'local_folder':
+        return jsonify({'error': '로컬 폴더 배치만 재실행할 수 있습니다.'}), 400
+
+    body = request.get_json(silent=True) or {}
+    only_flagged = bool(body.get('only_flagged'))
+    params = record.get('params') or {}
+    diarize_opts = params.get('diarize') or {'enabled': False, 'num_speakers': None}
+
+    if only_flagged:
+        flagged_names = [f['filename'] for f in (record.get('qa') or {}).get('flagged') or []]
+        if not flagged_names:
+            return jsonify({'error': 'QA에서 이상이 감지된 파일이 없습니다.'}), 400
+        state = BatchState(
+            source_key_for_path(source['path']),
+            options=batch_options_for(diarize_opts),
+        )
+        reset_count = state.reset_files(flagged_names)
+    else:
+        reset_count = None
+
+    new_job_id = str(uuid.uuid4())
+    jobs[new_job_id] = {
+        'status': 'queued', 'segments': [], 'info': None, 'error': None,
+        'created_at': time.time(), 'events': [],
+        'params': params,
+        'subtitle': record.get('subtitle') or {},
+        'translation': record.get('translation') or {'langs': [], 'backend': 'openai'},
+        'diarize': diarize_opts,
+    }
+    error = prepare_local_folder_job(new_job_id, source['path'])
+    if error:
+        jobs.pop(new_job_id, None)
+        return jsonify({'error': error}), 400
+
+    persist_job(new_job_id)
+    return jsonify({'job_id': new_job_id, 'reset_files': reset_count})
+
+
 @app.route('/api/download/<job_id>/<fmt>')
 def download(job_id, fmt):
-    if job_id not in jobs:
+    job = jobs.get(job_id) or job_store.load_job(job_id)
+    if not job:
         return jsonify({'error': 'Job not found'}), 404
-    job = jobs[job_id]
     if job['status'] != 'done':
         return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
     if fmt not in DOWNLOAD_FMT_EXTS:
@@ -1042,9 +1360,9 @@ def download(job_id, fmt):
 
 @app.route('/api/download/<job_id>/file/<int:file_index>/<fmt>')
 def download_batch_file(job_id, file_index, fmt):
-    if job_id not in jobs:
+    job = jobs.get(job_id) or job_store.load_job(job_id)
+    if not job:
         return jsonify({'error': 'Job not found'}), 404
-    job = jobs[job_id]
     if job['status'] != 'done':
         return jsonify({'error': '아직 완료되지 않았습니다.'}), 400
     if fmt not in DOWNLOAD_FMT_EXTS:
@@ -1147,4 +1465,12 @@ if __name__ == '__main__':
     print("-" * 40)
     print("Running at: http://localhost:5000")
     print("-" * 40 + "\n")
-    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+    try:
+        from waitress import serve
+        # channel_timeout must exceed the SSE ping interval; threads sized so
+        # a few live SSE viewers can't starve API requests.
+        print("[INFO] Serving with waitress")
+        serve(app, host='0.0.0.0', port=5000, threads=16, channel_timeout=120)
+    except ImportError:
+        print("[INFO] waitress not installed - falling back to Flask dev server")
+        app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)

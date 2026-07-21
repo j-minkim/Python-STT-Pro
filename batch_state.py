@@ -111,6 +111,23 @@ class BatchState:
         self.data['files'] = {}
         self._save()
 
+    def reset_files(self, display_names):
+        """Drop completion records whose name part matches any display name
+        (e.g. QA-flagged files), so the next run re-processes just those."""
+        targets = {
+            unicodedata.normalize('NFC', os.path.normcase(name)).replace(os.sep, '/')
+            for name in display_names
+        }
+        removed = [
+            key for key in self.data['files']
+            if key.split('|')[0] in targets
+        ]
+        for key in removed:
+            del self.data['files'][key]
+        if removed:
+            self._save()
+        return len(removed)
+
     def _save(self):
         self.data['updated_at'] = time.time()
         tmp_path = self.path + '.tmp'

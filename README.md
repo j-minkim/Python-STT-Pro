@@ -116,6 +116,22 @@ Windows는 `run.bat`을 더블클릭하거나 `run.bat transcribe "경로"` 형�
 
 ---
 
+## 웹 앱 동작 방식
+
+- **작업 큐**: 잡은 한 번에 하나씩 순차 실행됩니다. 여러 개를 제출하면 대기열에 쌓이고
+  "앞에 N개 작업" 상태가 표시됩니다 (Whisper 모델 중복 로드 방지).
+- **작업 기록**: 잡 상태가 `data/jobs/`에 저장되어 서버를 재시작해도 기록·다운로드가
+  유지됩니다. 새로고침하면 진행 중인 작업에 자동으로 다시 연결됩니다.
+- **품질 자동 검사**: 배치가 끝나면 반복 환각·언어 감지 이상을 자동 스캔해 로그에
+  표시하고, 작업 기록의 "이상 파일 재전사" 버튼으로 해당 파일만 다시 돌릴 수 있습니다.
+  CLI에서는 `python scripts/find_hallucinations.py [--reset]`.
+- **자동 정리**: 업로드 임시파일 7일, 결과물 30일 경과분은 자동 삭제됩니다
+  (`UPLOAD_RETENTION_DAYS`, `OUTPUT_RETENTION_DAYS`로 조정).
+- **웹 서버 실행**: `./run.sh web` (Windows: `run.bat web`). waitress WSGI 서버로
+  서빙되며, 미설치 시 Flask 개발 서버로 동작합니다.
+
+---
+
 ## 화자 분리 설정 (최초 1회, 무료)
 
 1. https://huggingface.co/join 에서 계정 생성 (이미 있으면 로그인)

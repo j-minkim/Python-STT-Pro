@@ -16,4 +16,9 @@ echo "[INFO] Installing/Updating dependencies..."
 pip install -r requirements.txt
 
 echo "[INFO] Starting Python STT Pro..."
-python3 main.py "$@"
+if [ "$1" = "web" ]; then
+    shift
+    python3 web_app.py "$@"
+else
+    python3 main.py "$@"
+fi
