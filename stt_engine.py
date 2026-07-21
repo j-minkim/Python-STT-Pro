@@ -42,12 +42,17 @@ class STTEngine:
         self.load_model()
         
         # segments is an iterable
+        # vad_filter skips silence (the main hallucination trigger) and
+        # condition_on_previous_text=False keeps a repetition loop in one
+        # window from contaminating the following windows.
         segments, info = self.model.transcribe(
-            audio_path, 
-            beam_size=5, 
-            language=language, 
+            audio_path,
+            beam_size=5,
+            language=language,
             initial_prompt=initial_prompt,
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500},
             word_timestamps=word_timestamps
         )
         

@@ -463,12 +463,17 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
     push_event(job_id, 'status', {'status': 'transcribing', 'message': message})
     jobs[job_id]['status'] = 'transcribing'
 
+    # vad_filter skips silence (the main hallucination trigger) and
+    # condition_on_previous_text=False keeps a repetition loop in one window
+    # from contaminating the following windows.
     segments_gen, info = engine.model.transcribe(
         audio_path,
         beam_size=5,
         language=language if language else None,
         initial_prompt=prompt if prompt else None,
-        condition_on_previous_text=True,
+        condition_on_previous_text=False,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
         word_timestamps=True,
     )
 
