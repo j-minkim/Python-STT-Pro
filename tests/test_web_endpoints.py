@@ -81,10 +81,18 @@ class WebEndpointTest(unittest.TestCase):
         deadline = time.time() + TIMEOUT
         while time.time() < deadline:
             job = web_app.jobs.get(job_id) or {}
-            if job.get('status') in ('done', 'error'):
+            if job.get('status') in ('done', 'error', 'cancelled'):
                 return job
             time.sleep(0.1)
         self.fail(f'job {job_id} did not finish: {web_app.jobs.get(job_id, {}).get("status")}')
+
+    def wait_status(self, job_id, status):
+        deadline = time.time() + TIMEOUT
+        while time.time() < deadline:
+            if (web_app.jobs.get(job_id) or {}).get('status') == status:
+                return
+            time.sleep(0.05)
+        self.fail(f'job {job_id} never reached {status}')
 
     def test_local_folder_batch_full_flow(self):
         web_app.load_engine = lambda job_id, model: fake_engine(['안녕하세요 전사 테스트'])
@@ -152,6 +160,65 @@ class WebEndpointTest(unittest.TestCase):
         second = self.submit_folder(self.make_folder('q2.mp3'))
         self.assertEqual(self.wait_done(first)['status'], 'done')
         self.assertEqual(self.wait_done(second)['status'], 'done')
+
+    def test_cancel_running_and_queued_jobs(self):
+        def slow_engine(job_id, model):
+            def transcribe(path, **kwargs):
+                def gen():
+                    for i in range(200):
+                        time.sleep(0.05)
+                        yield SimpleNamespace(
+                            start=float(i), end=i + 1.0, text=f'느린 세그먼트 {i}',
+                            words=[SimpleNamespace(start=float(i), end=i + 1.0, word='세그먼트')],
+                        )
+                info = SimpleNamespace(language='ko', language_probability=0.99, duration=200.0)
+                return gen(), info
+            return SimpleNamespace(model=SimpleNamespace(transcribe=transcribe))
+
+        web_app.load_engine = slow_engine
+        running = self.submit_folder(self.make_folder('slow.mp3'))
+        queued = self.submit_folder(self.make_folder('waiting.mp3'))
+
+        self.wait_status(running, 'transcribing')
+
+        # Queued job cancels instantly and never runs.
+        res = self.client.post(f'/api/cancel/{queued}')
+        self.assertEqual(res.get_json()['status'], 'cancelled')
+        self.assertEqual(web_app.jobs[queued]['status'], 'cancelled')
+
+        # Running job cancels cooperatively mid-file.
+        res = self.client.post(f'/api/cancel/{running}')
+        self.assertEqual(res.get_json()['status'], 'cancelling')
+        job = self.wait_done(running)
+        self.assertEqual(job['status'], 'cancelled')
+        self.assertIsNone(web_app.jobs[queued].get('batch_summary'))
+
+        # Cancelling a finished job is rejected.
+        res = self.client.post(f'/api/cancel/{running}')
+        self.assertEqual(res.status_code, 400)
+
+    def test_duplicate_folder_submission_rejected(self):
+        def slow_engine(job_id, model):
+            def transcribe(path, **kwargs):
+                def gen():
+                    for i in range(100):
+                        time.sleep(0.05)
+                        yield SimpleNamespace(start=float(i), end=i + 1.0, text='중복 테스트',
+                                              words=[SimpleNamespace(start=float(i), end=i + 1.0, word='중복')])
+                return gen(), SimpleNamespace(language='ko', language_probability=0.99, duration=100.0)
+            return SimpleNamespace(model=SimpleNamespace(transcribe=transcribe))
+
+        web_app.load_engine = slow_engine
+        folder = self.make_folder('dup.mp3')
+        first = self.submit_folder(folder)
+        res = self.client.post('/api/transcribe', data={
+            'model': 'tiny', 'language': 'ko', 'local_folder_path': folder,
+        })
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('이미 진행 중', res.get_json()['error'])
+
+        self.client.post(f'/api/cancel/{first}')
+        self.wait_done(first)
 
     def test_invalid_folder_rejected(self):
         res = self.client.post('/api/transcribe', data={

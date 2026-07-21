@@ -56,12 +56,29 @@ def persist_job(job_id):
             pass
 
 
+class JobCancelled(Exception):
+    """Raised inside a running job when the user requested cancellation."""
+
+
+def _check_cancelled(job_id):
+    if jobs.get(job_id, {}).get('cancel_requested'):
+        raise JobCancelled()
+
+
 def _job_worker():
     while True:
         job_id, fn = job_queue.get()
+        if jobs.get(job_id, {}).get('status') == 'cancelled':
+            job_queue.task_done()
+            continue
         _worker_state['current'] = job_id
         try:
             fn()
+        except JobCancelled:
+            job = jobs.get(job_id)
+            if job is not None:
+                job['status'] = 'cancelled'
+                push_event(job_id, 'done', {'message': '작업이 취소되었습니다.', 'cancelled': True})
         except Exception as e:
             job = jobs.get(job_id)
             if job is not None:
@@ -622,6 +639,7 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
 
     results = []
     for segment in segments_gen:
+        _check_cancelled(job_id)
         words = []
         for word in getattr(segment, 'words', None) or []:
             words.append({
@@ -710,6 +728,9 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         jobs[job_id]['status'] = 'done'
         push_event(job_id, 'done', {'message': '전사 완료!', 'total_segments': len(result['segments'])})
 
+    except JobCancelled:
+        jobs[job_id]['status'] = 'cancelled'
+        push_event(job_id, 'done', {'message': '작업이 취소되었습니다.', 'cancelled': True})
     except Exception as e:
         jobs[job_id]['status'] = 'error'
         jobs[job_id]['error'] = str(e)
@@ -783,7 +804,11 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 'total_files': total_files,
             })
 
+        cancelled = False
         for audio_path, resume_key, already_done in entries:
+            if jobs.get(job_id, {}).get('cancel_requested'):
+                cancelled = True
+                break
             index += 1
             filename = display_names.get(audio_path, os.path.basename(audio_path))
             if already_done:
@@ -845,6 +870,11 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     'downloads': result['download_urls'],
                     'translations': result.get('translation_urls'),
                 })
+            except JobCancelled:
+                # No mark_failed: the in-flight file stays pending so the
+                # next run of the same source picks it up.
+                cancelled = True
+                break
             except Exception as e:
                 if state and resume_key:
                     state.mark_failed(resume_key, e)
@@ -858,6 +888,22 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 push_event(job_id, 'file_error', failure)
             finally:
                 progress_ctx['done'] += pending_durations.get(audio_path, 0)
+
+        if cancelled:
+            jobs[job_id]['batch_summary'] = {
+                'total_files': total_files,
+                'successful': len(file_results),
+                'skipped': skipped_total,
+                'failed': len(failures),
+            }
+            jobs[job_id]['files'] = file_results
+            jobs[job_id]['status'] = 'cancelled'
+            push_event(job_id, 'done', {
+                'message': f'작업이 취소되었습니다. 이번에 완료한 {len(file_results)}개는 저장됐고, '
+                           '같은 소스를 다시 제출하면 나머지만 이어서 전사합니다.',
+                'cancelled': True,
+            })
+            return
 
         if not file_results and not skipped_total:
             raise ValueError('폴더 내 파일 전사가 모두 실패했습니다.')
@@ -978,6 +1024,11 @@ def prepare_local_folder_job(job_id, local_folder, fresh=False):
     local_folder = os.path.expanduser((local_folder or '').strip().strip('"').strip("'"))
     if not os.path.isdir(local_folder):
         return f'폴더를 찾을 수 없습니다: {local_folder} (서버에서 접근 가능한 경로여야 합니다.)'
+
+    duplicate = _same_local_folder_active(local_folder)
+    if duplicate and duplicate != job_id:
+        return ('같은 폴더의 작업이 이미 진행 중이거나 대기 중입니다. '
+                '작업 기록에서 기존 작업을 취소하거나 끝난 뒤 다시 제출하세요.')
 
     audio_paths = collect_supported_files([local_folder])
     if not audio_paths:
@@ -1295,6 +1346,42 @@ def jobs_list():
         'active_job_id': active,
         'queued_count': job_queue.qsize(),
     })
+
+
+@app.route('/api/cancel/<job_id>', methods=['POST'])
+def cancel_job(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({'error': '작업을 찾을 수 없거나 이미 이전 세션의 작업입니다.'}), 404
+
+    status = job.get('status')
+    if status in ('done', 'error', 'cancelled'):
+        return jsonify({'error': '이미 끝난 작업입니다.'}), 400
+
+    if _worker_state['current'] == job_id:
+        # Running: cooperative cancel — takes effect between segments/files.
+        job['cancel_requested'] = True
+        push_event(job_id, 'status', {'status': 'cancelling', 'message': '취소 요청됨 — 현재 구간까지만 처리하고 멈춥니다.'})
+        return jsonify({'status': 'cancelling'})
+
+    # Queued: mark cancelled; the worker skips it on dequeue.
+    job['status'] = 'cancelled'
+    push_event(job_id, 'done', {'message': '대기 중이던 작업을 취소했습니다.', 'cancelled': True})
+    return jsonify({'status': 'cancelled'})
+
+
+def _same_local_folder_active(folder):
+    """Return the job_id of an active/queued job on the same folder, if any."""
+    target = os.path.normcase(os.path.realpath(folder))
+    for job_id, job in jobs.items():
+        if job.get('status') not in job_store.ACTIVE_STATUSES:
+            continue
+        source = job.get('source') or {}
+        if source.get('type') != 'local_folder':
+            continue
+        if os.path.normcase(os.path.realpath(source.get('path', ''))) == target:
+            return job_id
+    return None
 
 
 @app.route('/api/requeue/<job_id>', methods=['POST'])
