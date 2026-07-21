@@ -108,6 +108,30 @@ class BatchStateTest(unittest.TestCase):
         second = BatchState('dir:/f', state_dir=self.state_dir, options={'diarize': True, 'num_speakers': 2})
         self.assertTrue(second.is_done('a.mp3|10|1'))
 
+    def test_nfd_manifest_keys_match_nfc_lookups(self):
+        # macOS stores filenames as NFD; a manifest written there must still
+        # match NFC keys (as produced on Windows or by file_key()).
+        import unicodedata
+        nfc_key = unicodedata.normalize('NFC', '김이삭.mp4') + '|10|1'
+        nfd_key = unicodedata.normalize('NFD', '김이삭.mp4') + '|10|1'
+        self.assertNotEqual(nfc_key, nfd_key)
+
+        state = self.make_state()
+        state.data['files'][nfd_key] = {'status': 'done', 'completed_at': 1.0}
+        state._save()
+
+        reloaded = self.make_state()
+        self.assertTrue(reloaded.is_done(nfc_key))
+
+    def test_file_key_is_nfc_normalized(self):
+        import unicodedata
+        nfd_name = unicodedata.normalize('NFD', '회의녹음.mp3')
+        media = os.path.join(self.tmp.name, nfd_name)
+        with open(media, 'wb') as f:
+            f.write(b'\xff\xfb')
+        key = BatchState.file_key(media, base_dir=self.tmp.name)
+        self.assertTrue(key.startswith(unicodedata.normalize('NFC', '회의녹음.mp3') + '|'))
+
     def test_manifest_is_valid_json_on_disk(self):
         state = self.make_state()
         state.mark_done('a.mp3|10|1')

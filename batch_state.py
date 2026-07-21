@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import time
+import unicodedata
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'batch_state')
 
@@ -52,6 +53,12 @@ class BatchState:
                 data = json.load(f)
             if data.get('source') != self.source_key or not isinstance(data.get('files'), dict):
                 raise ValueError('stale or corrupt state')
+            # Normalize legacy keys (macOS writes NFD filenames) so they keep
+            # matching the NFC keys file_key() produces.
+            data['files'] = {
+                unicodedata.normalize('NFC', key): value
+                for key, value in data['files'].items()
+            }
             return data
         except (OSError, ValueError, json.JSONDecodeError):
             return {'source': self.source_key, 'created_at': time.time(), 'files': {}}
@@ -68,7 +75,9 @@ class BatchState:
             rel = os.path.relpath(path, base_dir)
         else:
             rel = os.path.basename(path)
-        rel = os.path.normcase(rel).replace(os.sep, '/')
+        # NFC so the same share mounted on macOS (NFD names) and Windows (NFC)
+        # produces identical resume keys.
+        rel = unicodedata.normalize('NFC', os.path.normcase(rel).replace(os.sep, '/'))
         try:
             stat = os.stat(path)
             return f'{rel}|{stat.st_size}|{int(stat.st_mtime)}'

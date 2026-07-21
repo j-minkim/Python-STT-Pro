@@ -474,6 +474,17 @@ def transcribe_with_engine(job_id, engine, audio_path, language, prompt, filenam
         lang_info['total_files'] = file_total
     push_event(job_id, 'info', lang_info)
 
+    # Auto-detection can silently pick the wrong language when the clip opens
+    # with silence/music, which makes Whisper output read like a translation.
+    if not language and info.language_probability < 0.7:
+        push_event(job_id, 'warning', {
+            'message': (
+                f'⚠ {display_name}: 언어 감지 신뢰도가 낮습니다 '
+                f'({info.language}, {round(info.language_probability * 100)}%). '
+                '결과가 이상하면 언어를 직접 지정해 다시 전사하세요.'
+            ),
+        })
+
     results = []
     for segment in segments_gen:
         words = []

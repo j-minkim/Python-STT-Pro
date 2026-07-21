@@ -541,6 +541,18 @@
                             </select>
                         </div>
 
+                        <div class="form-group">
+                            <label>음성 언어</label>
+                            <select name="language">
+                                <option value="ko" selected>한국어 (권장)</option>
+                                <option value="">자동 감지</option>
+                                <option value="en">English</option>
+                                <option value="ja">日本語</option>
+                                <option value="zh">中文</option>
+                            </select>
+                            <span class="field-hint">자동 감지는 도입부가 무음·음악이면 언어를 잘못 인식해 전사가 영어 번역처럼 나올 수 있습니다. 언어를 알면 직접 지정하세요.</span>
+                        </div>
+
                         <div class="dropzone" id="dropzone">
                             <i data-lucide="upload-cloud" size="48"></i>
                             <p id="fileNameDisplay">파일을 드래그하거나 클릭하여 선택하세요</p>
@@ -1032,6 +1044,10 @@
                     // Simple progress fake for segments
                     let currentWidth = parseFloat(progressBar.style.width);
                     if (currentWidth < 95) progressBar.style.width = (currentWidth + 1) + '%';
+                }
+
+                if (event.type === 'warning') {
+                    addLog(event.data.message, 'error');
                 }
 
                 if (event.type === 'diarized') {
