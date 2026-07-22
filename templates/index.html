@@ -607,6 +607,18 @@
                         </div>
 
                         <div class="form-group">
+                            <label>AI 상담 요약 (선택)</label>
+                            <label class="lang-checkbox"><input type="checkbox" name="summary" value="1"> 파일별 상담 요약 리포트 생성 (.summary.md)</label>
+                            <div style="margin-top: 8px;">
+                                <select name="summary_backend">
+                                    <option value="openai">OpenAI API (OPENAI_API_KEY 필요)</option>
+                                    <option value="lmstudio">로컬 LMStudio (무료·오프라인, 1234 포트)</option>
+                                </select>
+                            </div>
+                            <span class="field-hint">상담 개요·학생 현황·조언·후속 액션을 파일마다 자동 정리합니다.</span>
+                        </div>
+
+                        <div class="form-group">
                             <label>자막(SRT) 한 줄 길이</label>
                             <div class="subtitle-len-grid">
                                 <div>
@@ -697,6 +709,17 @@
                             <li>🛠️ <strong>그래픽카드 가속:</strong> 현재 Whisper 엔진은 CUDA 전용이나, 차후 DirectML 업데이트를 통해 Radeon 가속이 추가될 예정입니다.</li>
                         </ul>
                     </div>
+                </div>
+
+                <div class="glass-card" id="searchCard">
+                    <h3 style="display:flex; align-items:center; gap:10px; margin-bottom:15px;">
+                        <i data-lucide="search"></i> 전사 내용 검색
+                    </h3>
+                    <div style="display:flex; gap:8px;">
+                        <input type="text" id="searchInput" placeholder="학생 이름, 키워드 등 (2자 이상)" style="flex:1;">
+                        <button type="button" class="btn btn-secondary" id="searchBtn" style="white-space:nowrap;">검색</button>
+                    </div>
+                    <div id="searchResults" style="font-size:0.85rem; margin-top:12px; max-height:320px; overflow-y:auto;"></div>
                 </div>
 
                 <div class="glass-card" id="historyCard">
@@ -831,6 +854,7 @@
                     <a href="${escapeHtml(fileData.downloads.json)}">JSON</a>
                     ${fileData.downloads.diarized_txt ? `<a href="${escapeHtml(fileData.downloads.diarized_txt)}">화자TXT</a>` : ''}
                     ${fileData.downloads.diarized_json ? `<a href="${escapeHtml(fileData.downloads.diarized_json)}">화자JSON</a>` : ''}
+                    ${fileData.downloads.summary ? `<a href="${escapeHtml(fileData.downloads.summary)}">요약</a>` : ''}
                 </div>
                 ${translations}
             `;
@@ -1081,6 +1105,11 @@
                     }
                 }
 
+                if (event.type === 'summary') {
+                    const label = event.data.filename ? `${event.data.filename}: ` : '';
+                    addLog(`${label}AI 요약 생성 완료`, 'success');
+                }
+
                 if (event.type === 'diarized') {
                     const label = event.data.filename ? `${event.data.filename}: ` : '';
                     addLog(`${label}화자 분리 완료 (화자 ${event.data.speakers}명)`, 'success');
@@ -1243,6 +1272,46 @@
         }
 
         document.getElementById('refreshJobsBtn').onclick = loadJobs;
+
+        // ---- 전사 내용 검색 ----
+        const searchInput = document.getElementById('searchInput');
+        const searchBtn = document.getElementById('searchBtn');
+        const searchResults = document.getElementById('searchResults');
+
+        function formatTime(seconds) {
+            const m = Math.floor((seconds || 0) / 60);
+            const s = Math.floor((seconds || 0) % 60);
+            return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        }
+
+        async function runSearch() {
+            const q = searchInput.value.trim();
+            if (q.length < 2) { searchResults.textContent = '검색어를 2자 이상 입력하세요.'; return; }
+            searchResults.textContent = '검색 중...';
+            try {
+                const res = await fetch(`/api/search?q=${encodeURIComponent(q)}`);
+                const data = await res.json();
+                if (data.error) { searchResults.textContent = data.error; return; }
+                if (!data.results.length) {
+                    searchResults.textContent = `결과 없음 (전사본 ${data.files_scanned}개 검색)`;
+                    return;
+                }
+                const esc = escapeHtml;
+                const pattern = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+                searchResults.innerHTML = data.results.map(r => {
+                    const text = esc(r.text).replace(pattern, m => `<mark>${m}</mark>`);
+                    return `<div style="padding:6px 0; border-bottom:1px solid rgba(255,255,255,0.06);">
+                        <div style="color:var(--text-muted); font-size:0.78rem;">${esc(r.filename)} · [${formatTime(r.start)}]</div>
+                        <div>${text}</div>
+                    </div>`;
+                }).join('') + (data.truncated ? `<div style="color:var(--text-muted); padding:6px 0;">결과가 많아 ${data.count}건까지만 표시했습니다.</div>` : '');
+            } catch (err) {
+                searchResults.textContent = `검색 실패: ${err.message}`;
+            }
+        }
+
+        searchBtn.onclick = runSearch;
+        searchInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runSearch(); } });
 
         (async () => {
             const data = await loadJobs();

@@ -151,7 +151,7 @@ from media_scan import (
     looks_like_supported_media,
     media_duration_seconds,
 )
-from batch_state import BatchState, source_key_for_path, source_key_for_url
+from batch_state import CompletionIndex
 import job_store
 from qa_checks import qa_report
 
@@ -214,15 +214,41 @@ def parse_diarize_opts(form):
     return {'enabled': enabled, 'num_speakers': num_speakers}
 
 
-def batch_options_for(diarize_opts):
-    """Resume-manifest options: completed entries only count when processed
+def parse_summary_opts(form):
+    enabled = (form.get('summary') or '').strip().lower() not in ('', '0', 'false', 'off')
+    backend = (form.get('summary_backend') or 'openai').strip().lower()
+    if backend not in ('openai', 'lmstudio'):
+        backend = 'openai'
+    return {'enabled': enabled, 'backend': backend}
+
+
+def batch_options_for(diarize_opts, summary_opts=None):
+    """Resume-index options: completed entries only count when processed
     with the same options."""
-    if not diarize_opts or not diarize_opts.get('enabled'):
-        return None
-    options = {'diarize': True}
-    if diarize_opts.get('num_speakers'):
-        options['num_speakers'] = diarize_opts['num_speakers']
-    return options
+    options = {}
+    if diarize_opts and diarize_opts.get('enabled'):
+        options['diarize'] = True
+        if diarize_opts.get('num_speakers'):
+            options['num_speakers'] = diarize_opts['num_speakers']
+    if summary_opts and summary_opts.get('enabled'):
+        options['summary'] = True
+    return options or None
+
+
+def run_summary_for_file(job_id, summarizer, segments, base_path, filename, file_index=None, file_total=None):
+    """Generate <base>.summary.md; failures warn but never fail the file."""
+    prefix = f'[{file_index}/{file_total}] ' if file_index and file_total else ''
+    push_event(job_id, 'status', {'status': 'summarizing', 'message': f'{prefix}{filename} AI 요약 생성 중...'})
+    summary_md = summarizer.summarize_segments(segments, filename=filename)
+    path = base_path + '.summary.md'
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(summary_md)
+    push_event(job_id, 'summary', {
+        'filename': filename,
+        'file_index': file_index,
+        'total_files': file_total,
+    })
+    return path
 
 
 def write_diarized_files(base_path, diarized_results):
@@ -396,11 +422,42 @@ def _unique_path(directory, filename):
     return candidate
 
 
-def export_to_downloads(outputs, translations=None, stem=None):
+def downloads_subfolder_for(media_path):
+    """Folder name for auto-organizing a local file's Download copies.
+
+    `.../컨설팅 영상_2025/9월_고1/x.mp4` → `2025년_9월_고1`: the file's
+    immediate folder name, prefixed with a year found in an ancestor folder
+    name (unless the name already contains one).
+    """
+    parent = os.path.dirname(os.path.realpath(media_path))
+    folder_name = unicodedata.normalize('NFC', os.path.basename(parent))
+    if not folder_name:
+        return None
+
+    year = None
+    probe = parent
+    for _ in range(4):
+        match = re.search(r'(20\d{2})', os.path.basename(probe))
+        if match:
+            year = match.group(1)
+            break
+        upper = os.path.dirname(probe)
+        if upper == probe:
+            break
+        probe = upper
+
+    if year and year not in folder_name:
+        return f'{year}년_{folder_name}'
+    return folder_name
+
+
+def export_to_downloads(outputs, translations=None, stem=None, subfolder=None):
     """Copy a job's output files into the user's Downloads folder.
 
     Names files by the original media stem (not the job UUID) so they're easy to
-    find. Returns the list of copied paths. Disabled by SAVE_TO_DOWNLOADS=0.
+    find; local-folder batches land in a per-source subfolder (e.g.
+    2025년_9월_고1). Returns the list of copied paths. Disabled by
+    SAVE_TO_DOWNLOADS=0.
     """
     if os.getenv("SAVE_TO_DOWNLOADS", "1") not in ("1", "true", "True"):
         return []
@@ -410,6 +467,9 @@ def export_to_downloads(outputs, translations=None, stem=None):
     downloads = get_downloads_path()
     if not os.path.isdir(downloads):
         return []
+    if subfolder:
+        downloads = os.path.join(downloads, _safe_stem(subfolder))
+        os.makedirs(downloads, exist_ok=True)
 
     stem = _safe_stem(stem or (outputs or {}).get("stem"))
     copied = []
@@ -417,6 +477,7 @@ def export_to_downloads(outputs, translations=None, stem=None):
     for fmt, ext in (
         ("txt", "txt"), ("srt", "srt"), ("json", "json"),
         ("diarized_txt", "diarized.txt"), ("diarized_json", "diarized.json"),
+        ("summary", "summary.md"),
     ):
         src = (outputs or {}).get(fmt)
         if src and os.path.exists(src):
@@ -500,7 +561,7 @@ def save_file_outputs(job_id, file_result, index):
 def public_file_downloads(job_id, index, outputs=None):
     fmts = ['txt', 'srt', 'json']
     if outputs:
-        fmts += [fmt for fmt in ('diarized_txt', 'diarized_json') if outputs.get(fmt)]
+        fmts += [fmt for fmt in ('diarized_txt', 'diarized_json', 'summary') if outputs.get(fmt)]
     return {
         fmt: f"/api/download/{job_id}/file/{index}/{fmt}"
         for fmt in fmts
@@ -699,6 +760,19 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
             base = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
             output_paths.update(write_diarized_files(base, diarized))
 
+        if (jobs[job_id].get('summary') or {}).get('enabled'):
+            from report_summarizer import ReportSummarizer
+            summarizer = ReportSummarizer(backend=jobs[job_id]['summary'].get('backend'))
+            base = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
+            try:
+                output_paths['summary'] = run_summary_for_file(
+                    job_id, summarizer, result['segments'], base, original_filename or 'transcript',
+                )
+            except JobCancelled:
+                raise
+            except Exception as e:
+                push_event(job_id, 'warning', {'message': f'⚠ AI 요약 실패 — {e}'})
+
         jobs[job_id]['outputs'] = output_paths
 
         translations = run_translations(
@@ -748,7 +822,7 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
 
         entries = []
         for audio_path in audio_paths:
-            resume_key = file_keys.get(audio_path) or (BatchState.file_key(audio_path) if state else None)
+            resume_key = file_keys.get(audio_path) or (CompletionIndex.file_key(audio_path) if state else None)
             already_done = bool(state and resume_key and state.is_done(resume_key))
             entries.append((audio_path, resume_key, already_done))
 
@@ -783,6 +857,9 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
             total_duration += duration
         progress_ctx = {'total': total_duration if durations_known else 0, 'done': 0.0}
 
+        # Local-folder batches auto-organize Download copies per source folder.
+        organize_downloads = (jobs.get(job_id, {}).get('source') or {}).get('type') == 'local_folder'
+
         diarize_enabled = bool((jobs.get(job_id, {}).get('diarize') or {}).get('enabled'))
         diarizer = None
         if diarize_enabled and skipped_total < total_files:
@@ -790,6 +867,13 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
             from diarizer import create_diarizer
             push_event(job_id, 'status', {'status': 'loading', 'message': '화자 분리 모델 로딩 중...'})
             diarizer = create_diarizer()
+
+        summary_opts = jobs.get(job_id, {}).get('summary') or {}
+        summarizer = None
+        if summary_opts.get('enabled') and skipped_total < total_files:
+            # Also fail fast (missing API key etc.) before transcribing.
+            from report_summarizer import ReportSummarizer
+            summarizer = ReportSummarizer(backend=summary_opts.get('backend'))
 
         engine = None  # Loaded lazily so a fully-completed batch skips the model load
         file_results = []
@@ -848,6 +932,19 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     base = os.path.join(app.config['OUTPUT_FOLDER'], job_id, outputs['stem'])
                     outputs.update(write_diarized_files(base, diarized))
 
+                if summarizer is not None:
+                    try:
+                        base = os.path.join(app.config['OUTPUT_FOLDER'], job_id, outputs['stem'])
+                        outputs['summary'] = run_summary_for_file(
+                            job_id, summarizer, result['segments'], base, filename,
+                            file_index=index, file_total=total_files,
+                        )
+                    except JobCancelled:
+                        raise
+                    except Exception as e:
+                        # Transcript is intact; summary alone failed.
+                        push_event(job_id, 'warning', {'message': f'⚠ {filename}: AI 요약 실패 — {e}'})
+
                 result['outputs'] = outputs
                 result['download_urls'] = public_file_downloads(job_id, index, outputs)
 
@@ -857,7 +954,10 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                     result['translations'] = translations
                     result['translation_urls'] = translation_download_urls(job_id, translations, file_index=index)
 
-                export_to_downloads(outputs, translations, stem=outputs.get('stem'))
+                export_to_downloads(
+                    outputs, translations, stem=outputs.get('stem'),
+                    subfolder=downloads_subfolder_for(audio_path) if organize_downloads else None,
+                )
 
                 file_results.append(result)
                 if state and resume_key:
@@ -1036,14 +1136,11 @@ def prepare_local_folder_job(job_id, local_folder, fresh=False):
 
     job = jobs[job_id]
     params = job.get('params') or {}
-    batch_state = BatchState(
-        source_key_for_path(local_folder),
-        options=batch_options_for(job.get('diarize')),
-    )
+    batch_state = CompletionIndex(options=batch_options_for(job.get('diarize'), job.get('summary')))
     if fresh:
-        batch_state.reset()
+        batch_state.reset_prefix(local_folder)
 
-    file_keys = {path: BatchState.file_key(path, base_dir=local_folder) for path in audio_paths}
+    file_keys = {path: CompletionIndex.file_key(path) for path in audio_paths}
     display_names = {path: os.path.relpath(path, local_folder) for path in audio_paths}
     job['filename'] = os.path.basename(os.path.normpath(local_folder)) or local_folder
     job['source'] = {'type': 'local_folder', 'path': local_folder}
@@ -1078,8 +1175,10 @@ def transcribe():
     jobs[job_id]['subtitle'] = parse_subtitle_opts(request.form)
     jobs[job_id]['translation'] = parse_translation_opts(request.form)
     jobs[job_id]['diarize'] = parse_diarize_opts(request.form)
+    jobs[job_id]['summary'] = parse_summary_opts(request.form)
     jobs[job_id]['params']['diarize'] = jobs[job_id]['diarize']
-    resume_options = batch_options_for(jobs[job_id]['diarize'])
+    jobs[job_id]['params']['summary'] = jobs[job_id]['summary']
+    resume_options = batch_options_for(jobs[job_id]['diarize'], jobs[job_id]['summary'])
 
     if folder_session_id:
         session = folder_sessions.get(folder_session_id)
@@ -1095,7 +1194,7 @@ def transcribe():
             return jsonify({'error': '전사할 파일을 하나 이상 선택해주세요.'}), 400
 
         jobs[job_id]['filename'] = 'gdrive_selected_files'
-        batch_state = BatchState(source_key_for_url(session.get('normalized_url') or session['url']), options=resume_options)
+        batch_state = CompletionIndex(options=resume_options)
 
         def selected_gdrive_job():
             try:
@@ -1213,7 +1312,7 @@ def transcribe():
 
                     # Re-downloaded files get fresh mtimes, so key folder items
                     # by name+size instead of the default path|size|mtime.
-                    batch_state = BatchState(source_key_for_url(normalize_gdrive_folder_url(gdrive_url)), options=resume_options)
+                    batch_state = CompletionIndex(options=resume_options)
                     file_keys = {}
                     for path in audio_paths:
                         try:
@@ -1348,6 +1447,62 @@ def jobs_list():
     })
 
 
+SEARCH_RESULT_LIMIT = 200
+
+
+@app.route('/api/search')
+def search_transcripts():
+    query = unicodedata.normalize('NFC', (request.args.get('q') or '').strip()).lower()
+    if len(query) < 2:
+        return jsonify({'error': '검색어를 2자 이상 입력하세요.'}), 400
+
+    import glob as _glob
+
+    # Latest transcript per source filename (superseded outputs ignored).
+    latest = {}
+    for path in _glob.glob(os.path.join(app.config['OUTPUT_FOLDER'], '*', '*.json')):
+        if path.endswith(('_diarized.json',)):
+            continue
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict) or not data.get('filename'):
+            continue
+        name = unicodedata.normalize('NFC', data['filename'])
+        mtime = os.path.getmtime(path)
+        if name not in latest or mtime > latest[name][0]:
+            latest[name] = (mtime, data)
+
+    results = []
+    truncated = False
+    for name in sorted(latest):
+        _, data = latest[name]
+        for seg in data.get('segments') or []:
+            text = unicodedata.normalize('NFC', seg.get('text') or '')
+            if query in text.lower():
+                results.append({
+                    'filename': name,
+                    'start': seg.get('start'),
+                    'end': seg.get('end'),
+                    'text': text,
+                })
+                if len(results) >= SEARCH_RESULT_LIMIT:
+                    truncated = True
+                    break
+        if truncated:
+            break
+
+    return jsonify({
+        'query': query,
+        'results': results,
+        'count': len(results),
+        'files_scanned': len(latest),
+        'truncated': truncated,
+    })
+
+
 @app.route('/api/cancel/<job_id>', methods=['POST'])
 def cancel_job(job_id):
     job = jobs.get(job_id)
@@ -1371,15 +1526,18 @@ def cancel_job(job_id):
 
 
 def _same_local_folder_active(folder):
-    """Return the job_id of an active/queued job on the same folder, if any."""
-    target = os.path.normcase(os.path.realpath(folder))
+    """Return the job_id of an active/queued job whose folder equals or
+    overlaps (parent/child) the given folder — overlapping runs would fight
+    over the same files."""
+    target = os.path.normcase(os.path.realpath(folder)).replace(os.sep, '/')
     for job_id, job in jobs.items():
         if job.get('status') not in job_store.ACTIVE_STATUSES:
             continue
         source = job.get('source') or {}
         if source.get('type') != 'local_folder':
             continue
-        if os.path.normcase(os.path.realpath(source.get('path', ''))) == target:
+        active = os.path.normcase(os.path.realpath(source.get('path', ''))).replace(os.sep, '/')
+        if active == target or active.startswith(target + '/') or target.startswith(active + '/'):
             return job_id
     return None
 
@@ -1403,10 +1561,7 @@ def requeue(job_id):
         flagged_names = [f['filename'] for f in (record.get('qa') or {}).get('flagged') or []]
         if not flagged_names:
             return jsonify({'error': 'QA에서 이상이 감지된 파일이 없습니다.'}), 400
-        state = BatchState(
-            source_key_for_path(source['path']),
-            options=batch_options_for(diarize_opts),
-        )
+        state = CompletionIndex(options=batch_options_for(diarize_opts, params.get('summary')))
         reset_count = state.reset_files(flagged_names)
     else:
         reset_count = None
@@ -1419,6 +1574,7 @@ def requeue(job_id):
         'subtitle': record.get('subtitle') or {},
         'translation': record.get('translation') or {'langs': [], 'backend': 'openai'},
         'diarize': diarize_opts,
+        'summary': params.get('summary') or {'enabled': False, 'backend': 'openai'},
     }
     error = prepare_local_folder_job(new_job_id, source['path'])
     if error:
@@ -1475,6 +1631,7 @@ DOWNLOAD_FMT_EXTS = {
     'json': 'json',
     'diarized_txt': 'diarized.txt',
     'diarized_json': 'diarized.json',
+    'summary': 'summary.md',
 }
 
 TRANSLATION_KINDS = {

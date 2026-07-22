@@ -130,6 +130,25 @@ class WebEndpointTest(unittest.TestCase):
         self.assertEqual(second['batch_summary']['successful'], 0)
         self.assertEqual(second['batch_summary']['skipped'], 2)
 
+    def test_parent_folder_submission_skips_subfolder_completions(self):
+        web_app.load_engine = lambda job_id, model: fake_engine(['증분 전사 테스트'])
+        parent = tempfile.mkdtemp(dir=self.tmp.name)
+        child_a = os.path.join(parent, '9월_고1')
+        child_b = os.path.join(parent, '9월_예비고1')
+        os.makedirs(child_a); os.makedirs(child_b)
+        for path in (os.path.join(child_a, 'a.mp3'), os.path.join(child_b, 'b.mp3')):
+            with open(path, 'wb') as f:
+                f.write(b'\xff\xfb' + b'\x00' * 16)
+
+        # Transcribe one subfolder, then submit the PARENT: only the new
+        # file in the other subfolder should be processed.
+        first = self.wait_done(self.submit_folder(child_a))
+        self.assertEqual(first['batch_summary']['successful'], 1)
+
+        second = self.wait_done(self.submit_folder(parent))
+        self.assertEqual(second['batch_summary']['skipped'], 1)
+        self.assertEqual(second['batch_summary']['successful'], 1)
+
     def test_qa_flags_hallucination_and_requeue_reprocesses(self):
         hallucinated = '네. ' * 30
         # One shared engine so the call counter spans both the original job
@@ -219,6 +238,81 @@ class WebEndpointTest(unittest.TestCase):
 
         self.client.post(f'/api/cancel/{first}')
         self.wait_done(first)
+
+    def test_downloads_subfolder_rule(self):
+        base = os.path.join(self.tmp.name, '컨설팅 영상_2025', '9월_고1')
+        os.makedirs(base, exist_ok=True)
+        media = os.path.join(base, 'x.mp4')
+        open(media, 'wb').close()
+        self.assertEqual(web_app.downloads_subfolder_for(media), '2025년_9월_고1')
+
+        yeared = os.path.join(self.tmp.name, '자료실 2026')
+        os.makedirs(yeared, exist_ok=True)
+        media2 = os.path.join(yeared, 'y.mp4')
+        open(media2, 'wb').close()
+        self.assertEqual(web_app.downloads_subfolder_for(media2), '자료실 2026')
+
+    def test_downloads_auto_organized_per_source_folder(self):
+        web_app.load_engine = lambda job_id, model: fake_engine(['자동 정리 테스트'])
+        downloads = tempfile.mkdtemp(dir=self.tmp.name)
+        parent = os.path.join(self.tmp.name, '컨설팅 영상_2025', '9월_고2')
+        os.makedirs(parent, exist_ok=True)
+        with open(os.path.join(parent, '상담녹화.mp3'), 'wb') as f:
+            f.write(b'\xff\xfb' + b'\x00' * 16)
+
+        os.environ['SAVE_TO_DOWNLOADS'] = '1'
+        os.environ['STT_DOWNLOADS_DIR'] = downloads
+        try:
+            job = self.wait_done(self.submit_folder(parent))
+        finally:
+            os.environ['SAVE_TO_DOWNLOADS'] = '0'
+            os.environ.pop('STT_DOWNLOADS_DIR', None)
+
+        self.assertEqual(job['status'], 'done', job.get('error'))
+        organized = os.path.join(downloads, '2025년_9월_고2', '상담녹화.txt')
+        self.assertTrue(os.path.exists(organized), os.listdir(downloads))
+
+    def test_summary_report_generated(self):
+        import report_summarizer
+
+        class FakeSummarizer:
+            def __init__(self, backend=None, model=None):
+                pass
+
+            def summarize_segments(self, segments, filename=''):
+                return f'# 상담 요약 — {filename}\n\n## 상담 개요\n요약 본문입니다.'
+
+        original = report_summarizer.ReportSummarizer
+        report_summarizer.ReportSummarizer = FakeSummarizer
+        web_app.load_engine = lambda job_id, model: fake_engine(['요약 대상 전사입니다'])
+        try:
+            folder = self.make_folder('요약대상.mp3')
+            job_id = self.submit_folder(folder, summary='1', summary_backend='openai')
+            job = self.wait_done(job_id)
+        finally:
+            report_summarizer.ReportSummarizer = original
+
+        self.assertEqual(job['status'], 'done', job.get('error'))
+        outputs = job['files'][0]['outputs']
+        self.assertIn('summary', outputs)
+        with open(outputs['summary'], encoding='utf-8') as f:
+            self.assertIn('상담 요약', f.read())
+        self.assertIn('summary', job['files'][0]['download_urls'])
+        res = self.client.get(job['files'][0]['download_urls']['summary'])
+        self.assertEqual(res.status_code, 200)
+
+    def test_search_finds_segments(self):
+        web_app.load_engine = lambda job_id, model: fake_engine(['등대지기 프로젝트 이야기입니다'])
+        self.wait_done(self.submit_folder(self.make_folder('검색용.mp3')))
+
+        res = self.client.get('/api/search?q=등대지기')
+        data = res.get_json()
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(data['count'], 1)
+        self.assertEqual(data['results'][0]['filename'], '검색용.mp3')
+        self.assertIn('등대지기', data['results'][0]['text'])
+
+        self.assertEqual(self.client.get('/api/search?q=ㄱ').status_code, 400)
 
     def test_invalid_folder_rejected(self):
         res = self.client.post('/api/transcribe', data={

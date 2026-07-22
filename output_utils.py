@@ -3,7 +3,10 @@ import os
 from pathlib import Path
 
 def get_downloads_path():
-    """Returns the user's Downloads folder path."""
+    """User's Downloads folder; override with STT_DOWNLOADS_DIR."""
+    override = os.getenv("STT_DOWNLOADS_DIR")
+    if override:
+        return override
     return str(Path.home() / "Downloads")
 
 def format_timestamp(seconds):

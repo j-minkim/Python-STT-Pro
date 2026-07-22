@@ -8,7 +8,7 @@ from audio_utils import record_audio, check_file_exists
 from gdrive_utils import download_from_gdrive, is_gdrive_url
 from output_utils import export_all, get_downloads_path
 from media_scan import collect_supported_files
-from batch_state import BatchState, source_key_for_path, source_key_for_list
+from batch_state import CompletionIndex
 from diarizer import create_diarizer, align_words_with_speakers
 from summarizer import LMStudioSummarizer
 
@@ -157,16 +157,18 @@ def main():
         # Build the work list: (label, resume_key, source, is_url).
         # resume_key is None for plain file lines until the file is confirmed to exist.
         items = []
+        state = CompletionIndex(options=batch_options)
         if os.path.isdir(input_path):
-            state = BatchState(source_key_for_path(input_path), options=batch_options)
             media_files = collect_supported_files([input_path])
             if not media_files:
                 console.print(f"[red]Error: No supported audio/video files found in '{input_path}'.[/red]")
                 return
             for path in media_files:
-                items.append((os.path.relpath(path, input_path), BatchState.file_key(path, base_dir=input_path), path, False))
+                items.append((os.path.relpath(path, input_path), CompletionIndex.file_key(path), path, False))
+            if args.fresh:
+                cleared = state.reset_prefix(input_path)
+                console.print(f"[yellow]--fresh: 이 폴더의 완료 기록 {cleared}개를 지우고 전부 다시 처리합니다.[/yellow]")
         elif os.path.isfile(input_path):
-            state = BatchState(source_key_for_list(input_path), options=batch_options)
             with open(input_path, "r", encoding="utf-8") as f:
                 lines = [line.strip() for line in f if line.strip()]
             for line in lines:
@@ -175,16 +177,15 @@ def main():
                     items.append((line, "url:" + line, line, True))
                 elif os.path.isdir(expanded):
                     for path in collect_supported_files([expanded]):
-                        items.append((path, BatchState.file_key(path, base_dir=expanded), path, False))
+                        items.append((path, CompletionIndex.file_key(path), path, False))
                 else:
                     items.append((expanded, None, expanded, False))
+            if args.fresh:
+                state.reset_files([label for label, _, _, is_url in items if not is_url])
+                console.print("[yellow]--fresh: 목록에 있는 파일들의 완료 기록을 지우고 다시 처리합니다.[/yellow]")
         else:
             console.print(f"[red]Error: '{args.input_file}' is not an existing folder or batch list file.[/red]")
             return
-
-        if args.fresh:
-            state.reset()
-            console.print("[yellow]--fresh: saved progress cleared, processing everything again.[/yellow]")
 
         done_before = sum(1 for _, key, _, _ in items if key and state.is_done(key))
         console.print(
@@ -204,7 +205,7 @@ def main():
         engine = None  # Loaded lazily so a fully-completed batch skips the model load
         for i, (label, key, source, is_url) in enumerate(items, 1):
             if key is None and check_file_exists(source):
-                key = BatchState.file_key(source)
+                key = CompletionIndex.file_key(source)
 
             if key and state.is_done(key):
                 console.print(f"[cyan][{i}/{len(items)}] 건너뜀 (완료됨): {label}[/cyan]")
