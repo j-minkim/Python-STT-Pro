@@ -44,12 +44,20 @@ class PyannoteDiarizer:
         if not token:
             raise RuntimeError(HF_TOKEN_HELP)
 
+        previous_weights_only_override = os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD")
+        os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
         try:
             try:
-                pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, use_auth_token=token)
-            except TypeError:
-                # Newer huggingface_hub renamed the parameter.
-                pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, token=token)
+                try:
+                    pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, use_auth_token=token)
+                except TypeError:
+                    # Newer huggingface_hub renamed the parameter.
+                    pipeline = Pipeline.from_pretrained(PYANNOTE_MODEL_ID, token=token)
+            finally:
+                if previous_weights_only_override is None:
+                    os.environ.pop("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", None)
+                else:
+                    os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = previous_weights_only_override
         except Exception as e:
             raise RuntimeError(f"pyannote 모델 로드 실패: {e}\n\n{HF_TOKEN_HELP}") from e
         if pipeline is None:

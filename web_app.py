@@ -888,10 +888,18 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 'total_files': total_files,
             })
 
+        source_root = (jobs.get(job_id, {}).get('source') or {}).get('path')
+
         cancelled = False
+        disconnected = False
         for audio_path, resume_key, already_done in entries:
             if jobs.get(job_id, {}).get('cancel_requested'):
                 cancelled = True
+                break
+            # A vanished source folder (unmounted share) would otherwise fail
+            # every remaining file one by one — abort once instead.
+            if source_root and not os.path.exists(audio_path) and not os.path.isdir(source_root):
+                disconnected = True
                 break
             index += 1
             filename = display_names.get(audio_path, os.path.basename(audio_path))
@@ -988,6 +996,20 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 push_event(job_id, 'file_error', failure)
             finally:
                 progress_ctx['done'] += pending_durations.get(audio_path, 0)
+
+        if disconnected:
+            jobs[job_id]['batch_summary'] = {
+                'total_files': total_files,
+                'successful': len(file_results),
+                'skipped': skipped_total,
+                'failed': len(failures),
+            }
+            jobs[job_id]['files'] = file_results
+            raise ValueError(
+                f'소스 폴더 연결이 끊겼습니다: {source_root} — '
+                f'완료한 {len(file_results)}개는 저장됐고, 폴더를 다시 연결한 뒤 '
+                '같은 경로를 재제출하면 나머지만 이어서 전사합니다.'
+            )
 
         if cancelled:
             jobs[job_id]['batch_summary'] = {

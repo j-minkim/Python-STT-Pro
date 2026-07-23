@@ -314,6 +314,30 @@ class WebEndpointTest(unittest.TestCase):
 
         self.assertEqual(self.client.get('/api/search?q=ㄱ').status_code, 400)
 
+    def test_batch_aborts_when_source_folder_disappears(self):
+        import shutil
+
+        def slow_engine(job_id, model):
+            def transcribe(path, **kwargs):
+                def gen():
+                    time.sleep(0.5)
+                    yield SimpleNamespace(start=0.0, end=1.0, text='연결 끊김 테스트',
+                                          words=[SimpleNamespace(start=0.0, end=1.0, word='테스트')])
+                return gen(), SimpleNamespace(language='ko', language_probability=0.99, duration=1.0)
+            return SimpleNamespace(model=SimpleNamespace(transcribe=transcribe))
+
+        web_app.load_engine = slow_engine
+        folder = self.make_folder('f1.mp3', 'f2.mp3', 'f3.mp3')
+        job_id = self.submit_folder(folder)
+        self.wait_status(job_id, 'transcribing')
+        shutil.rmtree(folder)  # simulate the share unmounting mid-batch
+
+        job = self.wait_done(job_id)
+        self.assertEqual(job['status'], 'error')
+        self.assertIn('연결이 끊겼습니다', job['error'] or '')
+        # It aborted once instead of failing every remaining file.
+        self.assertEqual((job.get('batch_summary') or {}).get('failed'), 0)
+
     def test_invalid_folder_rejected(self):
         res = self.client.post('/api/transcribe', data={
             'model': 'tiny', 'local_folder_path': '/no/such/folder/anywhere',
