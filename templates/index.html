@@ -611,8 +611,9 @@
                             <label class="lang-checkbox"><input type="checkbox" name="summary" value="1"> 파일별 상담 요약 리포트 생성 (.summary.md)</label>
                             <div style="margin-top: 8px;">
                                 <select name="summary_backend">
-                                    <option value="openai">OpenAI API (OPENAI_API_KEY 필요)</option>
-                                    <option value="lmstudio">로컬 LMStudio (무료·오프라인, 1234 포트)</option>
+                                    <option value="codex" selected>Codex 구독 (ChatGPT 계정, 추가 비용 없음)</option>
+                                    <option value="openai">OpenAI API (OPENAI_API_KEY 필요, 종량제)</option>
+                                    <option value="lmstudio">로컬 LMStudio (무료·오프라인, 느림)</option>
                                 </select>
                             </div>
                             <span class="field-hint">상담 개요·학생 현황·조언·후속 액션을 파일마다 자동 정리합니다.</span>

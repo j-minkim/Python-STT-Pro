@@ -216,9 +216,9 @@ def parse_diarize_opts(form):
 
 def parse_summary_opts(form):
     enabled = (form.get('summary') or '').strip().lower() not in ('', '0', 'false', 'off')
-    backend = (form.get('summary_backend') or 'openai').strip().lower()
-    if backend not in ('openai', 'lmstudio'):
-        backend = 'openai'
+    backend = (form.get('summary_backend') or 'codex').strip().lower()
+    if backend not in ('codex', 'openai', 'lmstudio'):
+        backend = 'codex'
     return {'enabled': enabled, 'backend': backend}
 
 

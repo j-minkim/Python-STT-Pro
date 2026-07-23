@@ -96,8 +96,12 @@ https://drive.google.com/file/d/LINK1/view
 (연도는 상위 폴더명에서 추출). 저장 루트는 `STT_DOWNLOADS_DIR`로 변경 가능합니다.
 
 **AI 상담 요약** — 웹의 "AI 상담 요약" 체크박스를 켜면 파일마다 상담 개요·학생
-현황·조언·후속 액션을 정리한 `<이름>.summary.md`가 함께 생성됩니다
-(OpenAI API 또는 로컬 LMStudio 선택).
+현황·조언·후속 액션을 정리한 `<이름>.summary.md`가 함께 생성됩니다. 엔진 선택:
+- **Codex 구독 (기본, 권장)**: ChatGPT 계정의 Codex CLI로 처리 — 추가 비용 없음,
+  1시간 상담 기준 요약 ~1분. `npm install -g @openai/codex` 후 `codex login`만 하면 됨.
+  (요약은 전용 `~/.codex-stt` 환경에서 실행되어 Codex 플러그인의 영향을 받지 않음)
+- OpenAI API: `OPENAI_API_KEY` 필요, 종량제.
+- 로컬 LMStudio: 무료·오프라인이지만 파일당 20분 이상으로 느림.
 
 **전사 내용 검색** — 웹 화면의 "전사 내용 검색" 카드에서 학생 이름·키워드로 모든
 전사본을 검색해 해당 문장과 시각([mm:ss])을 바로 찾을 수 있습니다.

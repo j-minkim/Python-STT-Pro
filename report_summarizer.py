@@ -6,22 +6,25 @@ partial summaries → final report.
 """
 
 import os
+import shutil
+import subprocess
+import tempfile
 
-from openai import OpenAI
+CHUNK_CHARS = 9000  # local-model default; larger models take far larger chunks
 
-CHUNK_CHARS = 9000  # local-model default; OpenAI models take far larger chunks
+CODEX_TIMEOUT_SECONDS = 1200
 
 
 def default_chunk_chars(backend):
-    """OpenAI(128k context) fits an hour-long transcript in one call; local
-    LMStudio models need small chunks. Override with STT_SUMMARY_CHUNK_CHARS."""
+    """OpenAI/Codex fit an hour-long transcript in one call; local LMStudio
+    models need small chunks. Override with STT_SUMMARY_CHUNK_CHARS."""
     override = os.getenv("STT_SUMMARY_CHUNK_CHARS")
     if override:
         try:
             return max(1000, int(override))
         except ValueError:
             pass
-    return 120000 if backend == "openai" else CHUNK_CHARS
+    return 120000 if backend in ("openai", "codex") else CHUNK_CHARS
 
 REPORT_SYSTEM_PROMPT = (
     "당신은 입시 컨설팅 상담 기록을 정리하는 전문 어시스턴트입니다. "
@@ -72,10 +75,49 @@ def split_chunks(text, chunk_chars=CHUNK_CHARS):
     return chunks
 
 
+def _resolve_codex_bin():
+    override = os.getenv("STT_CODEX_BIN")
+    if override:
+        return override
+    found = shutil.which("codex")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.local/bin/codex")
+    return fallback if os.path.exists(fallback) else None
+
+
+def _ensure_codex_home():
+    """Dedicated CODEX_HOME so third-party Codex plugins can't inject notices
+    into summaries. Shares the main login via an auth.json symlink."""
+    home = os.path.expanduser(os.getenv("STT_CODEX_HOME", "~/.codex-stt"))
+    os.makedirs(home, exist_ok=True)
+    auth = os.path.join(home, "auth.json")
+    if not os.path.lexists(auth):
+        main_auth = os.path.expanduser("~/.codex/auth.json")
+        if os.path.exists(main_auth):
+            os.symlink(main_auth, auth)
+    if not os.path.exists(auth):
+        raise RuntimeError(
+            "Codex 로그인이 필요합니다. 터미널에서 `codex login`을 실행한 뒤 다시 시도하세요."
+        )
+    return home
+
+
 class ReportSummarizer:
     def __init__(self, backend="openai", model=None):
         backend = (backend or "openai").lower()
-        if backend == "lmstudio":
+        if backend == "codex":
+            self.codex_bin = _resolve_codex_bin()
+            if not self.codex_bin:
+                raise RuntimeError(
+                    "Codex CLI를 찾을 수 없습니다. `npm install -g @openai/codex` 후 "
+                    "`codex login`을 실행하세요."
+                )
+            self.codex_home = _ensure_codex_home()
+            self.model = model or os.getenv("CODEX_SUMMARY_MODEL") or None
+            self.client = None
+        elif backend == "lmstudio":
+            from openai import OpenAI
             self.client = OpenAI(
                 base_url=os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
                 api_key="not-needed",
@@ -87,14 +129,53 @@ class ReportSummarizer:
             if not key:
                 raise RuntimeError(
                     "AI 요약에는 OPENAI_API_KEY가 필요합니다 (.env에 추가), "
-                    "또는 요약 엔진을 LMStudio로 선택하세요."
+                    "또는 요약 엔진을 Codex 구독/LMStudio로 선택하세요."
                 )
+            from openai import OpenAI
             self.client = OpenAI(api_key=key, base_url=os.getenv("OPENAI_BASE_URL"))
             self.model = model or os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
         self.backend = backend
         self.chunk_chars = default_chunk_chars(backend)
 
+    def _codex_chat(self, system_prompt, user_prompt):
+        prompt = f"{system_prompt}\n\n{user_prompt}"
+        out_path = None
+        try:
+            fd, out_path = tempfile.mkstemp(prefix="codex_summary_", suffix=".md")
+            os.close(fd)
+            cmd = [
+                self.codex_bin, "exec", "-",
+                "--skip-git-repo-check",
+                "-s", "read-only",
+                "--output-last-message", out_path,
+            ]
+            if self.model:
+                cmd += ["-m", self.model]
+            env = dict(os.environ)
+            env["CODEX_HOME"] = self.codex_home
+            result = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True,
+                timeout=CODEX_TIMEOUT_SECONDS, env=env, cwd=self.codex_home,
+            )
+            content = ""
+            if os.path.exists(out_path):
+                with open(out_path, encoding="utf-8") as f:
+                    content = f.read().strip()
+            if result.returncode != 0 and not content:
+                detail = (result.stderr or result.stdout or "").strip()[-300:]
+                raise RuntimeError(f"Codex 실행 실패 (코드 {result.returncode}): {detail}")
+            if not content:
+                raise RuntimeError("Codex 요약 응답이 비어 있습니다.")
+            return content
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Codex 요약이 {CODEX_TIMEOUT_SECONDS}초 안에 끝나지 않았습니다.")
+        finally:
+            if out_path and os.path.exists(out_path):
+                os.remove(out_path)
+
     def _chat(self, system_prompt, user_prompt):
+        if self.backend == "codex":
+            return self._codex_chat(system_prompt, user_prompt)
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
