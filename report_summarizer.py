@@ -9,7 +9,19 @@ import os
 
 from openai import OpenAI
 
-CHUNK_CHARS = 9000
+CHUNK_CHARS = 9000  # local-model default; OpenAI models take far larger chunks
+
+
+def default_chunk_chars(backend):
+    """OpenAI(128k context) fits an hour-long transcript in one call; local
+    LMStudio models need small chunks. Override with STT_SUMMARY_CHUNK_CHARS."""
+    override = os.getenv("STT_SUMMARY_CHUNK_CHARS")
+    if override:
+        try:
+            return max(1000, int(override))
+        except ValueError:
+            pass
+    return 120000 if backend == "openai" else CHUNK_CHARS
 
 REPORT_SYSTEM_PROMPT = (
     "당신은 입시 컨설팅 상담 기록을 정리하는 전문 어시스턴트입니다. "
@@ -80,6 +92,7 @@ class ReportSummarizer:
             self.client = OpenAI(api_key=key, base_url=os.getenv("OPENAI_BASE_URL"))
             self.model = model or os.getenv("OPENAI_SUMMARY_MODEL", "gpt-4o-mini")
         self.backend = backend
+        self.chunk_chars = default_chunk_chars(backend)
 
     def _chat(self, system_prompt, user_prompt):
         response = self.client.chat.completions.create(
@@ -101,7 +114,7 @@ class ReportSummarizer:
             raise RuntimeError("요약할 전사 내용이 없습니다.")
 
         title = f"# 상담 요약 — {filename}\n\n" if filename else ""
-        chunks = split_chunks(transcript)
+        chunks = split_chunks(transcript, chunk_chars=self.chunk_chars)
 
         if len(chunks) == 1:
             body = self._chat(
