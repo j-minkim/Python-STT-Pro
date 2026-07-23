@@ -811,6 +811,66 @@ def run_transcription_job(job_id, audio_path, model_size, language, prompt, orig
         push_event(job_id, 'error', {'message': str(e)})
 
 
+def wait_for_source_reconnect(job_id, source_root):
+    """Wait (and optionally try to remount) after the source folder vanished.
+
+    Returns True when the folder is reachable again. Configuration:
+    - STT_RECONNECT_WAIT_MINUTES (default 10): how long to wait before giving up
+    - STT_RECONNECT_POLL_SECONDS (default 10): how often to check
+    - STT_REMOUNT_URL (optional): share address to remount automatically —
+      macOS: smb://server/share (keychain credentials), Windows: \\\\server\\share
+    """
+    import subprocess
+
+    wait_minutes = float(os.getenv('STT_RECONNECT_WAIT_MINUTES', '10'))
+    poll_seconds = max(0.1, float(os.getenv('STT_RECONNECT_POLL_SECONDS', '10')))
+    remount_url = (os.getenv('STT_REMOUNT_URL') or '').strip()
+
+    deadline = time.time() + wait_minutes * 60
+    next_remount_at = 0.0
+    notified = False
+
+    while time.time() < deadline:
+        if jobs.get(job_id, {}).get('cancel_requested'):
+            return False
+        if os.path.isdir(source_root):
+            push_event(job_id, 'status', {
+                'status': 'batch',
+                'message': '소스 폴더 연결이 복구되었습니다. 이어서 전사합니다.',
+            })
+            return True
+
+        if not notified:
+            push_event(job_id, 'status', {
+                'status': 'waiting',
+                'message': (
+                    f'소스 폴더 연결이 끊겼습니다: {source_root} — '
+                    f'최대 {wait_minutes:g}분간 재연결을 기다립니다'
+                    + (' (자동 재마운트 시도 포함)' if remount_url else '')
+                    + '...'
+                ),
+            })
+            notified = True
+
+        if remount_url and time.time() >= next_remount_at:
+            try:
+                if sys.platform == 'darwin':
+                    subprocess.run(
+                        ['osascript', '-e', f'mount volume "{remount_url}"'],
+                        capture_output=True, timeout=30,
+                    )
+                elif sys.platform == 'win32':
+                    subprocess.run(['net', 'use', remount_url],
+                                   capture_output=True, timeout=30)
+            except Exception:
+                pass
+            next_remount_at = time.time() + 60
+
+        time.sleep(poll_seconds)
+
+    return os.path.isdir(source_root)
+
+
 def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch', display_names=None, state=None, file_keys=None, pre_skipped=None):
     try:
         pre_skipped = pre_skipped or []
@@ -897,10 +957,12 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 cancelled = True
                 break
             # A vanished source folder (unmounted share) would otherwise fail
-            # every remaining file one by one — abort once instead.
+            # every remaining file one by one — wait for reconnection (with
+            # optional auto-remount), and abort once only if it never returns.
             if source_root and not os.path.exists(audio_path) and not os.path.isdir(source_root):
-                disconnected = True
-                break
+                if not wait_for_source_reconnect(job_id, source_root):
+                    disconnected = True
+                    break
             index += 1
             filename = display_names.get(audio_path, os.path.basename(audio_path))
             if already_done:

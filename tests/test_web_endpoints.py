@@ -328,15 +328,52 @@ class WebEndpointTest(unittest.TestCase):
 
         web_app.load_engine = slow_engine
         folder = self.make_folder('f1.mp3', 'f2.mp3', 'f3.mp3')
-        job_id = self.submit_folder(folder)
-        self.wait_status(job_id, 'transcribing')
-        shutil.rmtree(folder)  # simulate the share unmounting mid-batch
+        os.environ['STT_RECONNECT_WAIT_MINUTES'] = '0'  # abort immediately
+        try:
+            job_id = self.submit_folder(folder)
+            self.wait_status(job_id, 'transcribing')
+            shutil.rmtree(folder)  # simulate the share unmounting mid-batch
+            job = self.wait_done(job_id)
+        finally:
+            os.environ.pop('STT_RECONNECT_WAIT_MINUTES', None)
 
-        job = self.wait_done(job_id)
         self.assertEqual(job['status'], 'error')
         self.assertIn('연결이 끊겼습니다', job['error'] or '')
         # It aborted once instead of failing every remaining file.
         self.assertEqual((job.get('batch_summary') or {}).get('failed'), 0)
+
+    def test_batch_resumes_when_source_folder_reconnects(self):
+        import shutil
+
+        def slow_engine(job_id, model):
+            def transcribe(path, **kwargs):
+                def gen():
+                    time.sleep(0.4)
+                    yield SimpleNamespace(start=0.0, end=1.0, text='재연결 테스트',
+                                          words=[SimpleNamespace(start=0.0, end=1.0, word='테스트')])
+                return gen(), SimpleNamespace(language='ko', language_probability=0.99, duration=1.0)
+            return SimpleNamespace(model=SimpleNamespace(transcribe=transcribe))
+
+        web_app.load_engine = slow_engine
+        folder = self.make_folder('r1.mp3', 'r2.mp3')
+        os.environ['STT_RECONNECT_WAIT_MINUTES'] = '0.2'   # up to 12s
+        os.environ['STT_RECONNECT_POLL_SECONDS'] = '0.2'
+        try:
+            job_id = self.submit_folder(folder)
+            self.wait_status(job_id, 'transcribing')
+            backup = folder + '_backup'
+            shutil.copytree(folder, backup)
+            shutil.rmtree(folder)          # share drops during file 1
+            time.sleep(1.0)
+            shutil.move(backup, folder)    # ...and comes back
+
+            job = self.wait_done(job_id)
+        finally:
+            os.environ.pop('STT_RECONNECT_WAIT_MINUTES', None)
+            os.environ.pop('STT_RECONNECT_POLL_SECONDS', None)
+
+        self.assertEqual(job['status'], 'done', job.get('error'))
+        self.assertEqual(job['batch_summary']['successful'], 2)
 
     def test_invalid_folder_rejected(self):
         res = self.client.post('/api/transcribe', data={

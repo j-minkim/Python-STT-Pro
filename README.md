@@ -145,6 +145,11 @@ Windows는 `run.bat`을 더블클릭하거나 `run.bat transcribe "경로"` 형�
   CLI에서는 `python scripts/find_hallucinations.py [--reset]`.
 - **자동 정리**: 업로드 임시파일 7일, 결과물 30일 경과분은 자동 삭제됩니다
   (`UPLOAD_RETENTION_DAYS`, `OUTPUT_RETENTION_DAYS`로 조정).
+- **연결 끊김 자동 복구**: 배치 도중 NAS/공유 폴더 연결이 끊기면 최대 10분간
+  재연결을 기다렸다가(`STT_RECONNECT_WAIT_MINUTES`) 자동으로 이어서 전사합니다.
+  `.env`에 `STT_REMOUNT_URL`(macOS `smb://...`, Windows `\\서버\공유`)을 설정하면
+  대기 중 1분마다 자동 재마운트도 시도합니다. 끝내 복구되지 않으면 한 번만
+  중단하고, 재제출 시 남은 파일부터 이어갑니다.
 - **웹 서버 실행**: `./run.sh web` (Windows: `run.bat web`). waitress WSGI 서버로
   서빙되며, 미설치 시 Flask 개발 서버로 동작합니다.
 
