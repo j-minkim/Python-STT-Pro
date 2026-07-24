@@ -86,16 +86,38 @@ def _resolve_codex_bin():
     return fallback if os.path.exists(fallback) else None
 
 
+def _sync_codex_auth(src, dst):
+    """Mirror the main Codex login into the dedicated home.
+
+    Prefers a symlink so token refreshes propagate automatically. Windows
+    accounts without Developer Mode/admin can't create symlinks (WinError
+    1314), so fall back to a copy, refreshing it whenever the source is newer.
+    """
+    if os.path.islink(dst):
+        return  # symlink already tracks the source
+    if os.path.exists(dst):
+        try:
+            if os.path.getmtime(dst) >= os.path.getmtime(src):
+                return  # copy is up to date
+        except OSError:
+            pass
+    if os.path.lexists(dst):
+        os.remove(dst)
+    try:
+        os.symlink(src, dst)
+    except (OSError, NotImplementedError, AttributeError):
+        shutil.copy2(src, dst)
+
+
 def _ensure_codex_home():
     """Dedicated CODEX_HOME so third-party Codex plugins can't inject notices
-    into summaries. Shares the main login via an auth.json symlink."""
+    into summaries. Shares the main login (symlink where possible, else copy)."""
     home = os.path.expanduser(os.getenv("STT_CODEX_HOME", "~/.codex-stt"))
     os.makedirs(home, exist_ok=True)
     auth = os.path.join(home, "auth.json")
-    if not os.path.lexists(auth):
-        main_auth = os.path.expanduser("~/.codex/auth.json")
-        if os.path.exists(main_auth):
-            os.symlink(main_auth, auth)
+    main_auth = os.path.expanduser("~/.codex/auth.json")
+    if os.path.exists(main_auth):
+        _sync_codex_auth(main_auth, auth)
     if not os.path.exists(auth):
         raise RuntimeError(
             "Codex 로그인이 필요합니다. 터미널에서 `codex login`을 실행한 뒤 다시 시도하세요."
