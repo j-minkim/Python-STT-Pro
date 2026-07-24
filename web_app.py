@@ -224,12 +224,14 @@ def parse_summary_opts(form):
 
 def batch_options_for(diarize_opts, summary_opts=None):
     """Resume-index options: completed entries only count when processed
-    with the same options."""
+    with the same options. Only options that change which output FILES are
+    produced belong here — diarize (adds _diarized.*) and summary (adds
+    .summary.md). num_speakers is a diarization hint that does not change the
+    output set, so it is intentionally excluded: leaving the speaker-count box
+    blank vs typing "2" must not force a full re-transcription."""
     options = {}
     if diarize_opts and diarize_opts.get('enabled'):
         options['diarize'] = True
-        if diarize_opts.get('num_speakers'):
-            options['num_speakers'] = diarize_opts['num_speakers']
     if summary_opts and summary_opts.get('enabled'):
         options['summary'] = True
     return options or None

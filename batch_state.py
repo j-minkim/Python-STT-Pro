@@ -35,10 +35,22 @@ def _norm_path(path):
     return _nfc(os.path.normcase(os.path.realpath(path))).replace(os.sep, '/')
 
 
+# Option keys that never define a file's identity for resume purposes — they
+# don't change which output files are produced. num_speakers is a diarization
+# hint (blank vs "2" yields the same _diarized.* outputs), so records written
+# with or without it must still match. Dropping them here also migrates older
+# index entries that stored num_speakers without any data rewrite.
+_NON_IDENTITY_OPTION_KEYS = {'num_speakers'}
+
+
 def _normalize_options(options):
     if not options:
         return {}
-    return {key: options[key] for key in sorted(options)}
+    return {
+        key: options[key]
+        for key in sorted(options)
+        if key not in _NON_IDENTITY_OPTION_KEYS
+    }
 
 
 class CompletionIndex:

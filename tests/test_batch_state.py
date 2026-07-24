@@ -91,13 +91,22 @@ class CompletionIndexTest(unittest.TestCase):
 
         self.assertTrue(self.make_index(options={'diarize': True}).is_done(key))
         self.assertFalse(self.make_index().is_done(key))
-        self.assertFalse(self.make_index(options={'diarize': True, 'num_speakers': 2}).is_done(key))
+
+    def test_num_speakers_does_not_affect_skip(self):
+        # A diarization speaker-count hint must not force re-transcription,
+        # and old records that stored num_speakers still match new runs
+        # without it.
+        media = make_media(os.path.join(self.tmp.name, 'a.mp3'))
+        key = CompletionIndex.file_key(media)
+        self.make_index(options={'diarize': True, 'num_speakers': 2}).mark_done(key)
+        self.assertTrue(self.make_index(options={'diarize': True}).is_done(key))
+        self.assertTrue(self.make_index(options={'diarize': True, 'num_speakers': 5}).is_done(key))
 
     def test_options_key_order_does_not_matter(self):
         media = make_media(os.path.join(self.tmp.name, 'a.mp3'))
         key = CompletionIndex.file_key(media)
-        self.make_index(options={'num_speakers': 2, 'diarize': True}).mark_done(key)
-        self.assertTrue(self.make_index(options={'diarize': True, 'num_speakers': 2}).is_done(key))
+        self.make_index(options={'summary': True, 'diarize': True}).mark_done(key)
+        self.assertTrue(self.make_index(options={'diarize': True, 'summary': True}).is_done(key))
 
     def test_file_key_changes_when_file_changes(self):
         media = os.path.join(self.tmp.name, 'audio.mp3')
