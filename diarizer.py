@@ -94,6 +94,11 @@ class PyannoteDiarizer:
             kwargs["num_speakers"] = int(num_speakers)
 
         annotation = self.pipeline(audio, **kwargs)
+        # pyannote.audio 4.x wraps the result in a DiarizeOutput; the Annotation
+        # (with itertracks) lives on .speaker_diarization. 3.x returns the
+        # Annotation directly.
+        if hasattr(annotation, "speaker_diarization"):
+            annotation = annotation.speaker_diarization
         segments = [
             (turn.start, turn.end, label)
             for turn, _, label in annotation.itertracks(yield_label=True)
