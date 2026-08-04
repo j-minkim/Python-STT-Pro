@@ -1,4 +1,5 @@
 import gdown
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -6,6 +7,12 @@ from urllib.parse import parse_qs, urlparse, urlunparse
 from rich.console import Console
 
 console = Console()
+
+
+def gdrive_cache_name(url):
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return f"gdrive_cache_{digest}"
+
 
 def download_from_gdrive(url, output_path):
     """

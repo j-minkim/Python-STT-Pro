@@ -10,7 +10,9 @@ import json
 import os
 import time
 
-JOBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'jobs')
+from runtime_config import DATA_ROOT
+
+JOBS_DIR = os.path.join(DATA_ROOT, 'jobs')
 
 # Statuses that mean "still working" — anything found in one of these states
 # at server startup did not survive the previous process.

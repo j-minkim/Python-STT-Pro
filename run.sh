@@ -16,7 +16,16 @@ echo "[INFO] Installing/Updating dependencies..."
 pip install -r requirements.txt
 
 echo "[INFO] Starting Python STT Pro..."
-if [ "$1" = "web" ]; then
+if [ "$1" = "web-instance" ]; then
+    if [ -z "$2" ] || [ -z "$3" ]; then
+        echo "Usage: ./run.sh web-instance <name> <port>"
+        exit 2
+    fi
+    export STT_INSTANCE="$2"
+    export STT_PORT="$3"
+    shift 3
+    python3 web_app.py "$@"
+elif [ "$1" = "web" ]; then
     shift
     python3 web_app.py "$@"
 else

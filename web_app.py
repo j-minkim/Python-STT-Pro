@@ -20,10 +20,12 @@ try:
 except ImportError:
     pass
 
+from runtime_config import DATA_ROOT, INSTANCE_NAME, server_port
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB
-app.config['UPLOAD_FOLDER'] = os.path.join(os.path.dirname(__file__), 'data', 'uploads')
-app.config['OUTPUT_FOLDER'] = os.path.join(os.path.dirname(__file__), 'data', 'outputs')
+app.config['UPLOAD_FOLDER'] = os.path.join(DATA_ROOT, 'uploads')
+app.config['OUTPUT_FOLDER'] = os.path.join(DATA_ROOT, 'outputs')
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
@@ -603,9 +605,10 @@ def download_selected_gdrive_files(job_id, session, selected_file_ids, state=Non
     if not selected_records:
         raise ValueError('선택된 Google Drive 파일이 없습니다.')
 
-    from gdrive_utils import download_gdrive_file_by_id
+    from gdrive_utils import download_gdrive_file_by_id, gdrive_cache_name
 
-    download_dir = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}_gdrive_selected")
+    folder_url = session.get('normalized_url') or session['url']
+    download_dir = os.path.join(app.config['UPLOAD_FOLDER'], gdrive_cache_name(folder_url))
     os.makedirs(download_dir, exist_ok=True)
 
     downloaded_paths = []
@@ -621,7 +624,10 @@ def download_selected_gdrive_files(job_id, session, selected_file_ids, state=Non
             continue
 
         output_path = os.path.join(download_dir, safe_download_name(record['filename'], index))
-        downloaded = download_gdrive_file_by_id(record['id'], output_path)
+        if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+            downloaded = output_path
+        else:
+            downloaded = download_gdrive_file_by_id(record['id'], output_path)
         if downloaded:
             downloaded_paths.append(downloaded)
             display_names[downloaded] = record['path']
@@ -636,6 +642,37 @@ def download_selected_gdrive_files(job_id, session, selected_file_ids, state=Non
         )
 
     return downloaded_paths, display_names, failures, file_keys, skipped_names
+
+
+def prepare_selected_gdrive_files(session, selected_file_ids):
+    selected = set(selected_file_ids)
+    selected_records = [
+        record for record in session['files']
+        if record['id'] in selected
+    ]
+    if not selected_records:
+        raise ValueError('선택된 Google Drive 파일이 없습니다.')
+
+    from gdrive_utils import download_gdrive_file_by_id, gdrive_cache_name
+
+    folder_url = session.get('normalized_url') or session['url']
+    download_dir = os.path.join(app.config['UPLOAD_FOLDER'], gdrive_cache_name(folder_url))
+    os.makedirs(download_dir, exist_ok=True)
+
+    audio_paths = []
+    display_names = {}
+    file_keys = {}
+    downloaders = {}
+    for index, record in enumerate(selected_records, 1):
+        output_path = os.path.join(download_dir, safe_download_name(record['filename'], index))
+        audio_paths.append(output_path)
+        display_names[output_path] = record['path']
+        file_keys[output_path] = f"gdrive:{record['id']}"
+        downloaders[output_path] = functools.partial(
+            download_gdrive_file_by_id, record['id'], output_path,
+        )
+
+    return audio_paths, display_names, file_keys, downloaders
 
 
 def load_engine(job_id, model_size):
@@ -873,7 +910,7 @@ def wait_for_source_reconnect(job_id, source_root):
     return os.path.isdir(source_root)
 
 
-def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch', display_names=None, state=None, file_keys=None, pre_skipped=None):
+def run_batch_transcription_job(job_id, audio_paths, model_size, language, prompt, batch_name='gdrive_folder_batch', display_names=None, state=None, file_keys=None, pre_skipped=None, downloaders=None, cleanup_downloads=False):
     try:
         pre_skipped = pre_skipped or []
         if not audio_paths and not pre_skipped:
@@ -881,6 +918,7 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
 
         display_names = display_names or {}
         file_keys = file_keys or {}
+        downloaders = downloaders or {}
 
         entries = []
         for audio_path in audio_paths:
@@ -911,6 +949,9 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
         for audio_path, _, already_done in entries:
             if already_done:
                 continue
+            if audio_path in downloaders:
+                durations_known = False
+                break
             duration = media_duration_seconds(audio_path)
             if not duration:
                 durations_known = False
@@ -968,6 +1009,8 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
             index += 1
             filename = display_names.get(audio_path, os.path.basename(audio_path))
             if already_done:
+                if cleanup_downloads and os.path.isfile(audio_path):
+                    os.remove(audio_path)
                 push_event(job_id, 'file_skipped', {
                     'filename': filename,
                     'file_index': index,
@@ -975,12 +1018,26 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 })
                 continue
 
-            push_event(job_id, 'file', {
-                'filename': filename,
-                'file_index': index,
-                'total_files': total_files,
-            })
+            download_complete = False
             try:
+                downloader = downloaders.get(audio_path)
+                if downloader is not None:
+                    push_event(job_id, 'status', {
+                        'status': 'downloading',
+                        'message': f'[{index}/{total_files}] {filename} 다운로드 중...',
+                    })
+                    jobs[job_id]['status'] = 'downloading'
+                    if not (os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0):
+                        downloaded = downloader()
+                        if not downloaded:
+                            raise ValueError(f'Google Drive 파일 다운로드 실패: {filename}')
+                    download_complete = True
+
+                push_event(job_id, 'file', {
+                    'filename': filename,
+                    'file_index': index,
+                    'total_files': total_files,
+                })
                 if engine is None:
                     engine = load_engine(job_id, model_size)
                 result = transcribe_with_engine(
@@ -1059,6 +1116,8 @@ def run_batch_transcription_job(job_id, audio_paths, model_size, language, promp
                 failures.append(failure)
                 push_event(job_id, 'file_error', failure)
             finally:
+                if cleanup_downloads and download_complete and os.path.isfile(audio_path):
+                    os.remove(audio_path)
                 progress_ctx['done'] += pending_durations.get(audio_path, 0)
 
         if disconnected:
@@ -1284,30 +1343,9 @@ def transcribe():
 
         def selected_gdrive_job():
             try:
-                push_event(job_id, 'status', {'status': 'downloading', 'message': '선택한 Google Drive 파일 다운로드 중...'})
-                jobs[job_id]['status'] = 'downloading'
-                downloaded_paths, display_names, failures, file_keys, skipped_names = download_selected_gdrive_files(
-                    job_id, session, selected_file_ids, state=batch_state,
+                audio_paths, display_names, file_keys, downloaders = prepare_selected_gdrive_files(
+                    session, selected_file_ids,
                 )
-                audio_paths = collect_supported_files(downloaded_paths)
-                if not audio_paths and not skipped_names:
-                    downloaded_names = ', '.join(os.path.basename(path) or path for path in downloaded_paths[:10])
-                    raise ValueError(
-                        '선택한 파일을 다운로드했지만 지원하는 오디오/비디오 파일을 찾지 못했습니다.'
-                        + (f' 다운로드 파일: {downloaded_names}' if downloaded_names else '')
-                    )
-
-                if failures:
-                    push_event(job_id, 'status', {
-                        'status': 'queued',
-                        'message': f'다운로드 성공 {len(downloaded_paths)}개, 실패 {len(failures)}개. 성공 파일만 전사합니다.',
-                    })
-                else:
-                    push_event(job_id, 'status', {
-                        'status': 'queued',
-                        'message': f'선택 파일 {len(audio_paths)}개를 전사합니다.'
-                        + (f' (이미 완료된 {len(skipped_names)}개는 다운로드 없이 건너뜁니다.)' if skipped_names else ''),
-                    })
 
                 run_batch_transcription_job(
                     job_id,
@@ -1319,7 +1357,8 @@ def transcribe():
                     display_names=display_names,
                     state=batch_state,
                     file_keys=file_keys,
-                    pre_skipped=skipped_names,
+                    downloaders=downloaders,
+                    cleanup_downloads=True,
                 )
             except Exception as e:
                 jobs[job_id]['status'] = 'error'
@@ -1791,16 +1830,19 @@ def status(job_id):
 
 
 if __name__ == '__main__':
+    port = server_port()
+    instance_label = INSTANCE_NAME or 'default'
     print("\n[INFO] Python STT Pro - Web Interface")
     print("-" * 40)
-    print("Running at: http://localhost:5000")
+    print(f"Instance: {instance_label}")
+    print(f"Running at: http://localhost:{port}")
     print("-" * 40 + "\n")
     try:
         from waitress import serve
         # channel_timeout must exceed the SSE ping interval; threads sized so
         # a few live SSE viewers can't starve API requests.
         print("[INFO] Serving with waitress")
-        serve(app, host='0.0.0.0', port=5000, threads=16, channel_timeout=120)
+        serve(app, host='0.0.0.0', port=port, threads=16, channel_timeout=120)
     except ImportError:
         print("[INFO] waitress not installed - falling back to Flask dev server")
-        app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+        app.run(debug=False, host='0.0.0.0', port=port, threaded=True)

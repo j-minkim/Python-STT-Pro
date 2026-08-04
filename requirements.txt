@@ -14,3 +14,4 @@ pyannote.audio
 setuptools<81
 # Legacy diarization fallback, not installable on Windows. Optional:
 # nemo_toolkit[asr]
+filelock>=3.19

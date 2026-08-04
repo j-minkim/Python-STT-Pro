@@ -22,7 +22,10 @@ import os
 import time
 import unicodedata
 
-STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'batch_state')
+from filelock import FileLock
+from runtime_config import SHARED_DATA_ROOT
+
+STATE_DIR = os.path.join(SHARED_DATA_ROOT, 'batch_state')
 GLOBAL_INDEX_NAME = 'global_index.json'
 
 
@@ -62,6 +65,7 @@ class CompletionIndex:
         self.dir = state_dir or STATE_DIR
         os.makedirs(self.dir, exist_ok=True)
         self.path = os.path.join(self.dir, GLOBAL_INDEX_NAME)
+        self.lock = FileLock(self.path + '.lock')
         self.data = self._load()
         self._migrate_legacy()
 
@@ -97,7 +101,9 @@ class CompletionIndex:
     # ---- queries / updates ---------------------------------------------
 
     def is_done(self, key):
-        entry = self.data['files'].get(_nfc(key))
+        with self.lock:
+            self.data = self._load()
+            entry = self.data['files'].get(_nfc(key))
         if not entry or entry.get('status') != 'done':
             return False
         return _normalize_options(entry.get('options')) == self.options
@@ -108,28 +114,34 @@ class CompletionIndex:
             entry['options'] = self.options
         if outputs:
             entry['outputs'] = outputs
-        self.data['files'][_nfc(key)] = entry
-        self._save()
+        with self.lock:
+            self.data = self._load()
+            self.data['files'][_nfc(key)] = entry
+            self._save_unlocked()
 
     def mark_failed(self, key, error):
-        self.data['files'][_nfc(key)] = {
-            'status': 'failed',
-            'failed_at': time.time(),
-            'error': str(error),
-        }
-        self._save()
+        with self.lock:
+            self.data = self._load()
+            self.data['files'][_nfc(key)] = {
+                'status': 'failed',
+                'failed_at': time.time(),
+                'error': str(error),
+            }
+            self._save_unlocked()
 
     def reset_prefix(self, folder):
         """Drop every record under a folder ("완료 기록 무시" / --fresh)."""
         prefix = _norm_path(folder) + '/'
-        removed = [
-            key for key in self.data['files']
-            if key.split('|')[0].startswith(prefix)
-        ]
-        for key in removed:
-            del self.data['files'][key]
-        if removed:
-            self._save()
+        with self.lock:
+            self.data = self._load()
+            removed = [
+                key for key in self.data['files']
+                if key.split('|')[0].startswith(prefix)
+            ]
+            for key in removed:
+                del self.data['files'][key]
+            if removed:
+                self._save_unlocked()
         return len(removed)
 
     def reset_files(self, display_names):
@@ -139,20 +151,22 @@ class CompletionIndex:
             _nfc(os.path.normcase(name)).replace(os.sep, '/')
             for name in display_names
         }
-        removed = []
-        for key in self.data['files']:
-            path_part = key.split('|')[0]
-            for target in targets:
-                if path_part == target or path_part.endswith('/' + target):
-                    removed.append(key)
-                    break
-        for key in removed:
-            del self.data['files'][key]
-        if removed:
-            self._save()
+        with self.lock:
+            self.data = self._load()
+            removed = []
+            for key in self.data['files']:
+                path_part = key.split('|')[0]
+                for target in targets:
+                    if path_part == target or path_part.endswith('/' + target):
+                        removed.append(key)
+                        break
+            for key in removed:
+                del self.data['files'][key]
+            if removed:
+                self._save_unlocked()
         return len(removed)
 
-    def _save(self):
+    def _save_unlocked(self):
         self.data['updated_at'] = time.time()
         tmp_path = self.path + '.tmp'
         with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -163,42 +177,42 @@ class CompletionIndex:
 
     def _migrate_legacy(self):
         """Absorb old per-source manifests (relative keys) once."""
-        migrated_any = False
-        for mpath in glob.glob(os.path.join(self.dir, '*.json')):
-            if os.path.basename(mpath) == GLOBAL_INDEX_NAME:
-                continue
-            try:
-                with open(mpath, encoding='utf-8') as f:
-                    legacy = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
-            source = legacy.get('source') or ''
-            files = legacy.get('files')
-            if not isinstance(files, dict):
-                continue
+        with self.lock:
+            self.data = self._load()
+            migrated_any = False
+            for mpath in glob.glob(os.path.join(self.dir, '*.json')):
+                if os.path.basename(mpath) == GLOBAL_INDEX_NAME:
+                    continue
+                try:
+                    with open(mpath, encoding='utf-8') as f:
+                        legacy = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    continue
+                source = legacy.get('source') or ''
+                files = legacy.get('files')
+                if not isinstance(files, dict):
+                    continue
 
-            if source.startswith('dir:'):
-                base = _nfc(source[4:]).replace(os.sep, '/').rstrip('/')
-                for key, entry in files.items():
-                    parts = _nfc(key).split('|')
-                    rel = parts[0]
-                    if rel.startswith('gdrive'):
-                        new_key = _nfc(key)
-                    else:
-                        new_key = '|'.join([f'{base}/{rel}'] + parts[1:])
-                    self.data['files'].setdefault(new_key, entry)
-            elif source.startswith('url:'):
-                for key, entry in files.items():
-                    if key.split('|')[0].startswith('gdrive'):
-                        self.data['files'].setdefault(_nfc(key), entry)
-            # 'list:' sources: relative keys can't be resolved to absolute
-            # paths reliably — those files will simply re-transcribe.
+                if source.startswith('dir:'):
+                    base = _nfc(source[4:]).replace(os.sep, '/').rstrip('/')
+                    for key, entry in files.items():
+                        parts = _nfc(key).split('|')
+                        rel = parts[0]
+                        if rel.startswith('gdrive'):
+                            new_key = _nfc(key)
+                        else:
+                            new_key = '|'.join([f'{base}/{rel}'] + parts[1:])
+                        self.data['files'].setdefault(new_key, entry)
+                elif source.startswith('url:'):
+                    for key, entry in files.items():
+                        if key.split('|')[0].startswith('gdrive'):
+                            self.data['files'].setdefault(_nfc(key), entry)
 
-            os.replace(mpath, mpath + '.migrated')
-            migrated_any = True
+                os.replace(mpath, mpath + '.migrated')
+                migrated_any = True
 
-        if migrated_any:
-            self._save()
+            if migrated_any:
+                self._save_unlocked()
 
 
 # Backward-compatible aliases: older call sites constructed BatchState with a

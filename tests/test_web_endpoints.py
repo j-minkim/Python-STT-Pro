@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -380,6 +381,93 @@ class WebEndpointTest(unittest.TestCase):
             'model': 'tiny', 'local_folder_path': '/no/such/folder/anywhere',
         })
         self.assertEqual(res.status_code, 400)
+
+    def test_gdrive_download_reuses_cache_across_jobs(self):
+        session = {
+            'normalized_url': 'https://drive.google.com/drive/folders/folder-1',
+            'files': [{
+                'id': 'file-1',
+                'path': '상담 영상.mp4',
+                'filename': '상담 영상.mp4',
+            }],
+        }
+
+        # Given: two submissions select the same file from the same Drive folder.
+        def fake_download(_file_id, output_path):
+            with open(output_path, 'wb') as output:
+                output.write(b'media')
+            return output_path
+
+        # When: each job prepares its selected Drive files.
+        with patch('gdrive_utils.download_gdrive_file_by_id', side_effect=fake_download) as download:
+            first = web_app.download_selected_gdrive_files(
+                'first-job', session, ['file-1'],
+            )[0]
+            second = web_app.download_selected_gdrive_files(
+                'second-job', session, ['file-1'],
+            )[0]
+
+        # Then: both jobs use the same resumable cache path.
+        self.assertEqual(first, second)
+        self.assertEqual(download.call_count, 1)
+
+    def test_gdrive_batch_downloads_processes_and_removes_one_file_at_a_time(self):
+        job_id = 'gdrive-streaming-test'
+        first = os.path.join(web_app.app.config['UPLOAD_FOLDER'], '001_first.mp3')
+        second = os.path.join(web_app.app.config['UPLOAD_FOLDER'], '002_second.mp3')
+        sequence = []
+
+        def downloader(path, label):
+            def download():
+                sequence.append(f'download:{label}')
+                with open(path, 'wb') as output:
+                    output.write(b'\xff\xfb' + b'\x00' * 16)
+                return path
+            return download
+
+        engine = fake_engine(['첫 번째 전사', '두 번째 전사'])
+        original_transcribe = engine.model.transcribe
+
+        def transcribe(path, **kwargs):
+            label = 'first' if path == first else 'second'
+            sequence.append(f'process:{label}')
+            if path == first:
+                self.assertFalse(os.path.exists(second))
+            return original_transcribe(path, **kwargs)
+
+        engine.model.transcribe = transcribe
+        web_app.load_engine = lambda _job_id, _model: engine
+        web_app.jobs[job_id] = {
+            'status': 'queued',
+            'events': [],
+            'subtitle': {'max_chars': 50, 'min_chars': 30},
+            'translation': {'enabled': False, 'languages': []},
+            'diarize': {'enabled': False, 'num_speakers': None},
+            'summary': {'enabled': False, 'backend': 'codex'},
+            'source': {'type': 'gdrive_selected'},
+        }
+
+        web_app.run_batch_transcription_job(
+            job_id,
+            [first, second],
+            'tiny',
+            'ko',
+            None,
+            display_names={first: 'first.mp3', second: 'second.mp3'},
+            downloaders={
+                first: downloader(first, 'first'),
+                second: downloader(second, 'second'),
+            },
+            cleanup_downloads=True,
+        )
+
+        self.assertEqual(
+            sequence,
+            ['download:first', 'process:first', 'download:second', 'process:second'],
+        )
+        self.assertFalse(os.path.exists(first))
+        self.assertFalse(os.path.exists(second))
+        self.assertEqual(web_app.jobs[job_id]['status'], 'done')
 
 
 if __name__ == '__main__':

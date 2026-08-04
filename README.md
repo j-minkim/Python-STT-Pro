@@ -156,6 +156,9 @@ Windows는 `run.bat`을 더블클릭하거나 `run.bat transcribe "경로"` 형�
   중단하고, 재제출 시 남은 파일부터 이어갑니다.
 - **웹 서버 실행**: `./run.sh web` (Windows: `run.bat web`). waitress WSGI 서버로
   서빙되며, 미설치 시 Flask 개발 서버로 동작합니다.
+- **병렬 웹 인스턴스**: `./run.sh web-instance shared 5001`. 이름별로 업로드,
+  출력, 작업 기록은 `data/instances/<이름>/`에 분리하고 완료 인덱스는 모든
+  인스턴스가 안전하게 공유합니다. 서로 다른 소스 폴더를 처리할 때 사용하세요.
 
 ---
 
