@@ -162,9 +162,11 @@ Windows는 `run.bat`을 더블클릭하거나 `run.bat transcribe "경로"` 형�
 ## 화자 분리 설정 (최초 1회, 무료)
 
 1. https://huggingface.co/join 에서 계정 생성 (이미 있으면 로그인)
-2. 아래 **두 모델 페이지 모두**에서 이름·소속을 입력하고 약관 동의 (즉시 자동 승인):
+2. 아래 **세 모델 페이지 모두**에서 이름·소속을 입력하고 약관 동의 (즉시 자동 승인):
    - https://huggingface.co/pyannote/speaker-diarization-3.1
    - https://huggingface.co/pyannote/segmentation-3.0
+   - https://huggingface.co/pyannote/speaker-diarization-community-1
+     (pyannote.audio 4.x가 내부적으로 사용 — 빠뜨리면 `GatedRepoError 403`)
 3. https://huggingface.co/settings/tokens → "New token" → Type: **Read** → 생성된 `hf_...` 복사
 4. 프로젝트 루트 `.env`에 추가:
    ```ini
@@ -174,6 +176,10 @@ Windows는 `run.bat`을 더블클릭하거나 `run.bat transcribe "경로"` 형�
 
 Windows PC에서도 같은 토큰을 `.env`에 넣으면 됩니다. GPU(CUDA) 또는 Apple Silicon(MPS)이
 있으면 자동 가속되고, `DIARIZE_DEVICE=cpu` 환경변수로 강제 지정할 수 있습니다.
+
+> ⚠️ NVIDIA GPU나 Apple Silicon이 없는 환경(예: AMD 내장그래픽 Windows PC)에서는
+> 화자 분리가 CPU로만 동작해 실시간의 약 0.6배(1시간 영상 ≈ 30분+)로 매우 느립니다.
+> 화자 분리가 필요한 작업은 Apple Silicon(MPS)이나 NVIDIA GPU 머신에서 처리하세요.
 
 ---
 
